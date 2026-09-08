@@ -1,0 +1,2368 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+umask 077
+
+MESH_ROOT="${MESH_ROOT:-$HOME/.config/mesh}"
+CONF="${MESH_CONF:-$MESH_ROOT/conf}"
+STATE="${MESH_STATE:-$MESH_ROOT/state}"
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+SSH_DIR="$HOME/.ssh"
+AK="$SSH_DIR/authorized_keys"
+SC="$SSH_DIR/config"
+KH="$STATE/known_hosts"
+AS="$STATE/allowed_signers"
+NS="mesh"
+TTL="${MESH_TTL:-604800}"
+CTO="${MESH_CONNECT_TIMEOUT:-5}"
+B1="# BEGIN MESH MANAGED"
+B2="# END MESH MANAGED"
+RBOARD=".config/mesh/state/board"
+
+if [ -f "$STATE/key" ]; then TID="$STATE/key"; else TID="$STATE/key.pub"; fi
+
+SOPTS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KH"
+  -o "IdentityFile=$TID" -o IdentitiesOnly=yes -o "ConnectTimeout=$CTO"
+  -o LogLevel=ERROR)
+
+GOPTS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KH"
+  -o "ConnectTimeout=$CTO" -o LogLevel=ERROR)
+
+die() {
+  echo "mesh: $*" >&2
+  [ -d "$STATE" ] && printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$STATE/last-error" 2>/dev/null
+  exit 1
+}
+log() { printf '%s mesh %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+
+me() { cat "$STATE/name" 2>/dev/null; }
+
+ensure_dirs() {
+  mkdir -p "$CONF/nodes" "$CONF/keys" "$CONF/hostkeys" \
+    "$STATE/records" "$STATE/roster" "$STATE/tunnels" "$STATE/in" \
+    "$STATE/board" "$STATE/tmp" "$STATE/hostkeys" "$STATE/invites" "$SSH_DIR"
+  chmod 700 "$SSH_DIR"
+}
+
+node_get() {
+  awk -F= -v k="$2" '$1==k{print substr($0,length(k)+2);exit}' \
+    "$CONF/nodes/$1.conf" 2>/dev/null
+}
+
+node_get_all() {
+  awk -F= -v k="$2" '$1==k{print substr($0,length(k)+2)}' \
+    "$CONF/nodes/$1.conf" 2>/dev/null
+}
+
+nodes() {
+  local f b
+  for f in "$CONF/nodes"/*.conf; do
+    [ -f "$f" ] || continue
+    b=${f##*/}
+    b=${b%.conf}
+    case "$b" in ''|*[!a-zA-Z0-9_-]*) continue ;; esac
+    printf '%s\n' "$b"
+  done
+}
+
+peers() { nodes | grep -vx "$(me)"; }
+
+is_member() { [ -f "$CONF/keys/$1.pub" ]; }
+
+ADMINS="$CONF/admins"
+OPERATORS="$CONF/operators"
+GFILE="$CONF/groups"
+GSIG="$CONF/groups.sig"
+NSG="mesh-groups"
+
+my_allow() { cat "$STATE/allow" 2>/dev/null || printf '*\n'; }
+
+groups_verified() {
+  local p serial seen
+  [ -f "$ADMINS" ] && [ -f "$GFILE" ] && [ -f "$GSIG" ] || return 1
+  for p in $(awk '{print $1}' "$ADMINS"); do
+    if ssh-keygen -Y verify -f "$ADMINS" -I "$p" -n "$NSG" -s "$GSIG" \
+        < "$GFILE" >/dev/null 2>&1; then
+      serial=$(awk '$1=="serial"{print $2; exit}' "$GFILE")
+      case "$serial" in ''|*[!0-9]*) return 1 ;; esac
+      seen=$(cat "$STATE/groups-serial" 2>/dev/null)
+      case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
+      if [ "$serial" -lt "$seen" ]; then
+        log "groups file is older than one already seen ($serial < $seen), ignoring"
+        return 1
+      fi
+      [ "$serial" -gt "$seen" ] && printf '%s\n' "$serial" > "$STATE/groups-serial"
+      return 0
+    fi
+  done
+  return 1
+}
+
+node_groups() {
+  if [ -f "$ADMINS" ]; then
+    groups_verified || return 0
+    awk -v n="$1" '$1==n{print $2; exit}' "$GFILE"
+  else
+    node_get "$1" groups
+  fi
+  return 0
+}
+
+allowed_in() {
+  local n=$1 a g x y
+  a=$(my_allow)
+  [ "$a" = "*" ] && return 0
+  g=$(node_groups "$n")
+  [ -n "$g" ] || return 1
+  for x in ${a//,/ }; do
+    for y in ${g//,/ }; do
+      [ "$x" = "$y" ] && return 0
+    done
+  done
+  return 1
+}
+
+is_termux() {
+  case "$(uname -o 2>/dev/null)" in *[Aa]ndroid*) return 0 ;; esac
+  [ -x /system/bin/app_process ]
+}
+
+tx_prefix() {
+  case "${PREFIX:-}" in
+    *com.termux*) printf '%s\n' "$PREFIX" ;;
+    *) printf '/data/data/com.termux/files/usr\n' ;;
+  esac
+}
+
+p_profile() {
+  local ct
+  is_termux && { printf 'mobile\n'; return 0; }
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    [ "$(systemd-detect-virt 2>/dev/null)" != "none" ] && { printf 'fixed\n'; return 0; }
+  fi
+  ct=$(cat /sys/devices/virtual/dmi/id/chassis_type 2>/dev/null)
+  case "$ct" in
+    8|9|10|11|12|14|30|31|32) printf 'mobile\n'; return 0 ;;
+    ''|*[!0-9]*) ;;
+    *) printf 'fixed\n'; return 0 ;;
+  esac
+  ls /sys/class/power_supply/BAT* >/dev/null 2>&1 && { printf 'mobile\n'; return 0; }
+  printf 'fixed\n'
+}
+
+alive_interval() { [ "$(p_profile)" = mobile ] && printf '180\n' || printf '30\n'; }
+poll_interval() { [ "$(p_profile)" = mobile ] && printf '120\n' || printf '30\n'; }
+
+is_private() {
+  case "$1" in
+    10.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+  esac
+  return 1
+}
+
+have_git() { command -v git >/dev/null 2>&1; }
+
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+  fi
+}
+
+invites_prune() {
+  local f now e
+  now=$(date +%s)
+  for f in "$STATE"/invites/*; do
+    [ -f "$f" ] || continue
+    e=$(cat "$f" 2>/dev/null)
+    case "$e" in ''|*[!0-9]*) rm -f "$f"; continue ;; esac
+    [ "$e" -lt "$now" ] && rm -f "$f"
+  done
+  return 0
+}
+
+invites_active() {
+  local f
+  invites_prune
+  for f in "$STATE"/invites/*; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "${f##*/}"
+  done
+  return 0
+}
+
+cmd_invite() {
+  local ttl="${MESH_INVITE_TTL:-1800}" tok exp serve=0 sport="${MESH_JOIN_PORT:-43117}" wait=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --serve) serve=1; shift ;;
+      --sport) sport=$2; shift 2 ;;
+      --wait) wait=$2; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  tok=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ -n "$tok" ] || die "could not generate a token"
+  exp=$(( $(date +%s) + ttl ))
+  printf '%s\n' "$exp" > "$STATE/invites/$tok"
+  log "token: $tok"
+  if [ "$serve" -eq 1 ]; then
+    case "$sport" in ''|*[!0-9]*) die "sport must be numeric" ;; esac
+    [ -n "$wait" ] || wait=$ttl
+    case "$wait" in ''|*[!0-9]*) die "wait must be numeric" ;; esac
+    serve_join "$tok" "$sport" "$wait"
+    return
+  fi
+  log "one use, valid $((ttl / 60)) min. On the new device, after copying"
+  log "conf there:  mesh init <new-name> --token $tok"
+  log "it then joins on this node's next tick, or run: mesh adopt --scan --auto"
+}
+
+ct_eq() {
+  local r
+  r=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ "$(sha256 "$r|$1")" = "$(sha256 "$r|$2")" ]
+}
+
+nc_listen() {
+  local t=$1 p=$2 in=$3 out=$4
+  if [ -z "$NC_STYLE" ]; then
+    if nc -h 2>&1 | grep -qi openbsd; then NC_STYLE=bsd; else NC_STYLE=trad; fi
+  fi
+  if [ "$NC_STYLE" = bsd ]; then
+    timeout "$t" nc -l "$p" < "$in" > "$out" 2>/dev/null
+  else
+    timeout "$t" nc -l -p "$p" < "$in" > "$out" 2>/dev/null
+  fi
+}
+
+serve_join() {
+  local tok=$1 sport=$2 wait=$3 deadline left strm rf psha tag a line
+  command -v nc >/dev/null 2>&1 || die "nc is required for --serve"
+  conf_is_repo && cmd_sync
+  strm="$STATE/tmp/join-strm.$$"
+  rf="$STATE/tmp/join-ready.$$"
+  tar -C "$MESH_ROOT" -cf "$strm.tar" conf || die "could not pack conf"
+  psha=$(sha256sum "$strm.tar" | awk '{print $1}')
+  tag=$(sha256 "mesh-join1|$psha|$tok")
+  { printf 'MESH1 %s %s %s\n' "$(wc -c < "$strm.tar" | tr -d ' ')" "$psha" "$tag"
+    cat "$strm.tar"
+  } > "$strm"
+  for a in $(p_addrs); do
+    log "on the new device run:  mesh join <new-name> $a:$sport --token $tok"
+  done
+  deadline=$(( $(date +%s) + wait ))
+  while :; do
+    left=$(( deadline - $(date +%s) ))
+    [ "$left" -gt 0 ] || { log "serve window closed, no device joined"; break; }
+    invites_active | grep -qx "$tok" || { log "invite expired or burned, stopping"; break; }
+    : > "$rf"
+    nc_listen "$left" "$sport" "$strm" "$rf"
+    [ -s "$rf" ] || continue
+    line=$(head -1 "$rf" | tr -d '\r')
+    handle_ready "$tok" "$psha" "$line" && break
+  done
+  rm -f "$strm" "$strm.tar" "$rf"
+}
+
+handle_ready() {
+  local tok=$1 psha=$2 name user port addrs tag want br a t2
+  set -- $3
+  [ "$1" = "MESH1-READY" ] || return 1
+  name=$2 user=$3 port=$4 addrs=$5 tag=$6
+  case "$name" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+  case "$user" in ''|*[!a-zA-Z0-9._-]*) return 1 ;; esac
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  case "$addrs" in ''|*[!0-9a-fA-F.:,]*) return 1 ;; esac
+  want=$(sha256 "mesh-ready1|$name|$user|$port|$addrs|$psha|$tok")
+  ct_eq "$tag" "$want" || { log "READY with a bad authenticator, ignored"; return 1; }
+  [ -f "$CONF/nodes/$name.conf" ] && { log "READY for existing node $name, ignored"; return 1; }
+  br=$(gitc symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$br" ] || br=main
+  for a in ${addrs//,/ }; do
+    GIT_SSH_COMMAND=$(adopt_gs "$port") gitc fetch -q "$user@$a:.config/mesh/conf" \
+      "$br" >/dev/null 2>&1 || continue
+    if t2=$(verify_proof "$name"); then
+      if adopt_finish; then
+        rm -f "$STATE/invites/$t2"
+        printf '%s\n' "$a" > "$STATE/roster/$name"
+        cmd_sync
+        log "adopted $name from $user@$a:$port (invite burned)"
+        return 0
+      fi
+      log "conf merge from $name failed"
+    else
+      log "conf from $user@$a:$port has no valid invite proof, REJECTED"
+    fi
+  done
+  return 1
+}
+
+join_session() {
+  local name=$1 tok=$2 host=$3 m size psha tag tf sn sp user port addrs n=0 seed="" br
+  shift 3
+  IFS=' ' read -r -t 30 m size psha tag <&3 || die "no header from the seed"
+  [ "$m" = "MESH1" ] || die "unrecognized protocol header"
+  case "$size" in ''|*[!0-9]*) die "bad size in header" ;; esac
+  [ "$size" -le 52428800 ] || die "conf implausibly large"
+  tf="$STATE/tmp/join.$$.tar"
+  head -c "$size" <&3 > "$tf"
+  [ "$(wc -c < "$tf" | tr -d ' ')" = "$size" ] || die "short read from the seed"
+  [ "$(sha256sum "$tf" | awk '{print $1}')" = "$psha" ] || die "conf corrupted in transit"
+  ct_eq "$tag" "$(sha256 "mesh-join1|$psha|$tok")" || \
+    die "AUTHENTICATION FAILED: wrong token, or something other than the real
+     seed answered. No conf was installed."
+  tar -C "$MESH_ROOT" -xf "$tf" || die "unpack failed"
+  rm -f "$tf"
+  log "conf verified against the invite token and installed"
+  cmd_init "$name" --token "$tok" "$@"
+  for sn in $(nodes); do
+    [ "$sn" = "$name" ] && continue
+    sp=$(node_get "$sn" port)
+    [ -n "$sp" ] || continue
+    if ident "$host" "$sp" 2>/dev/null | grep -qx "$sn"; then
+      printf '%s\n' "$host" > "$STATE/roster/$sn"
+      seed=$sn
+      log "seed identified as $sn at $host"
+      break
+    fi
+  done
+  user=$(node_get "$name" user)
+  port=$(node_get "$name" port)
+  addrs=$(p_addrs | paste -sd, -)
+  [ -n "$addrs" ] || die "no local address to announce"
+  printf 'MESH1-READY %s %s %s %s %s\n' "$name" "$user" "$port" "$addrs" \
+    "$(sha256 "mesh-ready1|$name|$user|$port|$addrs|$psha|$tok")" >&3
+  exec 3>&-
+  log "announced readiness, waiting for the seed to adopt"
+  br=$(gitc symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$br" ] || br=main
+  while [ "$n" -lt 45 ]; do
+    if [ -n "$seed" ] && GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentityFile=$TID -o IdentitiesOnly=yes" \
+        gitc fetch -q "$seed:.config/mesh/conf" "$br" >/dev/null 2>&1; then
+      gitc merge -q --no-edit FETCH_HEAD >/dev/null 2>&1
+      strip_proof "$name"
+      gen_as
+      gen_kh
+      compile_ak
+      compile_sc
+      cmd_sync
+      log "adopted; the mesh is live here. Next: mesh schedule"
+      [ -s "$OPERATORS" ] && \
+        log "this mesh uses restricted transport; also run: mesh restrict"
+      return 0
+    fi
+    sleep 2
+    n=$((n + 1))
+  done
+  log "no confirmation yet; the seed adopts on its next tick, or run"
+  log "'mesh adopt --scan --auto' there"
+}
+
+cmd_join() {
+  local name="" seed="" tok="" host sport
+  local -a passthru=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --token) tok=$2; shift 2 ;;
+      --port|--user|--rport|--static|--groups|--allow) passthru+=("$1" "$2"); shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$name" ]; then name=$1; else seed=$1; fi; shift ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$seed" ] && [ -n "$tok" ] || \
+    die "usage: mesh join <new-name> <seed-addr[:port]> --token <tok> [init options]"
+  case "$name" in *[!a-zA-Z0-9_-]*) die "name must be [a-zA-Z0-9_-]" ;; esac
+  [ -n "$(me)" ] && die "already initialized as $(me)"
+  ls "$CONF"/keys/*.pub >/dev/null 2>&1 && die "conf already present here; use mesh init"
+  have_git || die "git is required"
+  host=${seed%%:*}
+  sport=${seed##*:}
+  [ "$sport" = "$seed" ] && sport="${MESH_JOIN_PORT:-43117}"
+  case "$sport" in ''|*[!0-9]*) die "bad seed port" ;; esac
+  ensure_dirs
+  join_session "$name" "$tok" "$host" "${passthru[@]}" 3<>"/dev/tcp/$host/$sport" || \
+    die "could not reach the seed at $host:$sport (is 'mesh invite --serve' running there?)"
+}
+
+boards() {
+  local n
+  for n in $(nodes); do
+    is_member "$n" || continue
+    [ -n "$(node_get "$n" static)" ] && printf '%s\n' "$n"
+  done
+  return 0
+}
+
+ordered_peers() { { boards; peers; } | grep -vx "$(me)" | awk '!x[$0]++'; }
+
+port_open() { timeout "$CTO" bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+p_addrs() {
+  { ip -o -4 addr show 2>/dev/null | awk '!/ lo /{print $4}' | cut -d/ -f1
+    ifconfig 2>/dev/null | awk '/inet /{for(i=1;i<=NF;i++)if($i=="inet")print $(i+1)}'
+  } | grep -vE '^127\.|^$' | sort -u
+  return 0
+}
+
+p_hostkey_pub() {
+  local d t
+  for t in ed25519 rsa ecdsa; do
+    for d in "$(tx_prefix)/etc/ssh" /etc/ssh; do
+      [ -f "$d/ssh_host_${t}_key.pub" ] && { cat "$d/ssh_host_${t}_key.pub"; return 0; }
+    done
+  done
+  return 1
+}
+
+p_ensure_sshd() {
+  local port
+  port=$(node_get "$(me)" port)
+  [ -n "$port" ] || return 1
+  port_open 127.0.0.1 "$port" && return 0
+  if is_termux; then
+    sv up sshd 2>/dev/null || sshd 2>/dev/null
+  else
+    systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || \
+      /usr/sbin/sshd 2>/dev/null
+  fi
+  sleep 1
+  port_open 127.0.0.1 "$port"
+}
+
+have_systemd_user() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -d "/run/user/$(id -u)/systemd" ] || return 1
+  systemctl --user show-environment >/dev/null 2>&1
+}
+
+start_daemon_bg() {
+  if ! ( exec 4>"$STATE/daemon.lock"; flock -n 4 ) 2>/dev/null; then
+    log "daemon already running"
+    return 0
+  fi
+  if [ -f "$STATE/daemon.log" ] &&
+      [ "$(wc -c <"$STATE/daemon.log")" -gt "${MESH_LOG_MAX:-1048576}" ]; then
+    tail -n 500 "$STATE/daemon.log" > "$STATE/daemon.log.tmp" &&
+      mv "$STATE/daemon.log.tmp" "$STATE/daemon.log"
+  fi
+  nohup "$SELF" daemon >>"$STATE/daemon.log" 2>&1 &
+  log "daemon started (pid $!, log $STATE/daemon.log)"
+}
+
+p_schedule() {
+  local self unit boot
+  self=$SELF
+  log "profile: $(p_profile) (keepalive $(alive_interval)s, poll $(poll_interval)s)"
+  if is_termux && command -v termux-job-scheduler >/dev/null 2>&1; then
+    boot="$HOME/.termux/boot/start-mesh.sh"
+    if [ -d "$HOME/.termux/boot" ]; then
+      printf '#!%s/bin/sh\nexec %q daemon\n' "$(tx_prefix)" "$self" > "$boot"
+      chmod 700 "$boot"
+      log "termux:boot script installed: $boot"
+    else
+      log "no ~/.termux/boot (install Termux:Boot and open it once)"
+    fi
+    printf '#!%s/bin/sh\nexec %q daemon --once\n' "$(tx_prefix)" "$self" > "$STATE/tick.sh"
+    chmod 700 "$STATE/tick.sh"
+    termux-job-scheduler --job-id 3388 --script "$STATE/tick.sh" \
+      --period-ms "${MESH_PERIOD_MS:-86400000}" --persisted true --network any \
+      >/dev/null 2>&1
+    log "job-scheduler 3388 installed as the restart-if-dead backstop"
+    start_daemon_bg
+    log "undo: mesh reset (cancels the job and removes the boot script)"
+    return 0
+  fi
+  if have_systemd_user; then
+    unit="$HOME/.config/systemd/user/mesh.service"
+    mkdir -p "$(dirname "$unit")"
+    { printf '[Unit]\nDescription=mesh\nAfter=network.target\n\n'
+      printf '[Service]\nType=simple\nExecStart=%s daemon\n' "$self"
+      printf 'Restart=always\nRestartSec=10\n\n'
+      printf '[Install]\nWantedBy=default.target\n'
+    } > "$unit"
+    systemctl --user daemon-reload >/dev/null 2>&1
+    systemctl --user enable --now mesh.service >/dev/null 2>&1
+    if loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+      log "lingering enabled, so it starts at boot without a login"
+    else
+      log "could not enable lingering; run: sudo loginctl enable-linger $(id -un)"
+    fi
+    log "systemd user unit installed and started: $unit"
+    log "status: systemctl --user status mesh   undo: mesh reset"
+    return 0
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    { crontab -l 2>/dev/null | grep -v "mesh tick" | grep -v "mesh refresh" |
+        grep -v "mesh daemon"
+      printf '@reboot %q daemon\n' "$self"
+      printf '23 4 * * * %q daemon --once\n' "$self"
+    } | crontab - 2>/dev/null
+    log "cron installed: daemon at boot, daily backstop at 04:23"
+    start_daemon_bg
+    log "undo: mesh reset"
+    return 0
+  fi
+  log "no supervisor found. Start '$self daemon' at boot yourself"
+  log "(systemd user unit, launchd agent, or an init script)."
+  return 1
+}
+
+unresolved_members() {
+  local n
+  for n in $(peers); do
+    is_member "$n" || continue
+    [ -f "$STATE/roster/$n" ] || return 0
+  done
+  return 1
+}
+
+cmd_daemon() {
+  local once=0 prev cur n=0 poll cycles pnodes cnodes last
+  [ "$1" = "--once" ] && once=1
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  exec 4>"$STATE/daemon.lock"
+  if ! flock -n 4; then
+    [ "$once" -eq 1 ] && { log "daemon already running"; return 0; }
+    die "daemon already running"
+  fi
+  poll=$(poll_interval)
+  cycles=$(( ${MESH_BACKSTOP:-21600} / poll ))
+  [ "$cycles" -lt 1 ] && cycles=1
+  log "daemon starting (profile $(p_profile), poll ${poll}s)"
+  cmd_tick
+  if [ "$once" -eq 1 ]; then
+    log "single pass done"
+    return 0
+  fi
+  prev=$(p_addrs | sort | tr '\n' ',')
+  pnodes=$(nodes | sort | tr '\n' ',')
+  last=$(date +%s)
+  while :; do
+    sleep "$poll"
+    cur=$(p_addrs | sort | tr '\n' ',')
+    if [ "$cur" != "$prev" ]; then
+      log "addresses changed: ${prev:-none} -> ${cur:-none}"
+      prev=$cur
+      n=0
+      cmd_tick
+      continue
+    fi
+    if unresolved_members && [ $(( $(date +%s) - last )) -ge "${MESH_RETRY:-300}" ]; then
+      log "peers still unresolved, retrying"
+      last=$(date +%s)
+      n=0
+      cmd_tick
+      continue
+    fi
+    cnodes=$(nodes | sort | tr '\n' ',')
+    if [ "$cnodes" != "$pnodes" ]; then
+      log "membership changed, converging"
+      pnodes=$cnodes
+      n=0
+      cmd_tick
+      continue
+    fi
+    n=$((n + 1))
+    if [ "$n" -ge "$cycles" ]; then
+      n=0
+      cmd_tick
+    else
+      tunnels
+    fi
+  done
+}
+
+load_platform() {
+  [ -f "$CONF/platform.sh" ] && . "$CONF/platform.sh"
+  [ -f "$STATE/platform.sh" ] && . "$STATE/platform.sh"
+  return 0
+}
+
+gen_as() {
+  local n t="$AS.$$"
+  : > "$t"
+  for n in $(nodes); do
+    [ -f "$CONF/keys/$n.pub" ] || continue
+    printf '%s %s\n' "$n" "$(cut -d' ' -f1,2 "$CONF/keys/$n.pub")" >> "$t"
+  done
+  mv "$t" "$AS"
+}
+
+gen_kh() {
+  local n f t="$KH.$$"
+  : > "$t"
+  for n in $(nodes); do
+    f="$STATE/hostkeys/$n.pub"
+    [ -f "$f" ] || f="$CONF/hostkeys/$n.pub"
+    [ -f "$f" ] || continue
+    printf '%s %s\n' "$n" "$(cut -d' ' -f1,2 "$f")" >> "$t"
+  done
+  mv "$t" "$KH"
+}
+
+ext_path() {
+  local p="${SELF%/*}/mesh-$1"
+  [ -x "$p" ] || p=$(command -v "mesh-$1" 2>/dev/null)
+  [ -n "$p" ] && [ -x "$p" ] || return 1
+  printf '%s\n' "$p"
+}
+
+board_addr() {
+  local r
+  r=$(cat "$STATE/roster/$1" 2>/dev/null)
+  case "$r" in
+    ''|via\ *|jump\ *) node_get "$1" static ;;
+    *) printf '%s\n' "$r" ;;
+  esac
+}
+
+guest_addr() {
+  local n=$1 rcmd out addr hk
+  rcmd=$(node_get "$n" resolve)
+  if [ -z "$rcmd" ] && [ "$(node_get "$n" dynamic)" = 1 ]; then
+    if rcmd=$(ext_path "resolve-$n"); then
+      :
+    else
+      guest_gossiped "$n" && return 0
+      log "$n is dynamic, no 'mesh-resolve-$n' here, and no fresh record"
+      return 1
+    fi
+  fi
+  if [ -z "$rcmd" ]; then
+    node_get "$n" static
+    return 0
+  fi
+  if ! out=$(sh -c "$rcmd" 2>/dev/null); then
+    guest_gossiped "$n" && return 0
+    return 1
+  fi
+  addr=$(printf '%s\n' "$out" | sed -n 1p)
+  hk=$(printf '%s\n' "$out" | sed -n 2p)
+  [ -n "$addr" ] || return 1
+  if [ -n "$hk" ]; then
+    printf '%s\n' "$hk" > "$STATE/hostkeys/$n.pub"
+    gen_kh
+    publish_guest "$n" "$addr" "$hk"
+  fi
+  printf '%s\n' "$addr"
+}
+
+guest_record_fresh() {
+  local f="$STATE/records/guest-$1.rec" sq
+  [ -f "$f" ] || return 1
+  sq=$(awk -F= '$1=="seq"{print $2; exit}' "$f")
+  case "$sq" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( $(date +%s) - sq )) -le "${MESH_GUEST_TTL:-3600}" ]
+}
+
+publish_guest() {
+  local n=$1 addr=$2 hk=$3 f="$STATE/records/guest-$1.rec"
+  [ -f "$STATE/key" ] || return 0
+  { printf 'guest=%s\nby=%s\nseq=%s\naddr=%s\nhostkey=%s\n' \
+      "$n" "$(me)" "$(date +%s)" "$addr" "$hk"
+  } > "$f"
+  rm -f "$f.sig"
+  ssh-keygen -Y sign -f "$STATE/key.pub" -n "$NS" "$f" >/dev/null 2>&1 || rm -f "$f"
+  return 0
+}
+
+guest_gossiped() {
+  local n=$1 f="$STATE/records/guest-$1.rec" sq now addr hk
+  if guest_record_fresh "$n"; then
+    :
+  elif [ -z "$GUEST_REFRESHED" ]; then
+    GUEST_REFRESHED=1
+    log "no fresh record for $n, asking peers"
+    exchange
+  fi
+  [ -f "$f" ] || return 1
+  sq=$(awk -F= '$1=="seq"{print $2; exit}' "$f")
+  case "$sq" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s)
+  [ $((now - sq)) -le "${MESH_GUEST_TTL:-3600}" ] || {
+    log "gossiped endpoint for $n is stale, ignoring"
+    return 1
+  }
+  addr=$(awk -F= '$1=="addr"{print $2; exit}' "$f")
+  hk=$(awk -F= '$1=="hostkey"{print substr($0,9); exit}' "$f")
+  [ -n "$addr" ] && [ -n "$hk" ] || return 1
+  printf '%s\n' "$hk" > "$STATE/hostkeys/$n.pub"
+  gen_kh
+  log "$n located from a record published by $(awk -F= '$1=="by"{print $2; exit}' "$f")"
+  printf '%s\n' "$addr"
+  return 0
+}
+
+gitc() { git -C "$CONF" -c core.hooksPath=/dev/null "$@"; }
+
+conf_is_repo() { have_git && [ -d "$CONF/.git" ]; }
+
+conf_peers() {
+  local n
+  for n in $(peers); do
+    is_member "$n" || continue
+    [ -f "$STATE/roster/$n" ] || continue
+    printf '%s:.config/mesh/conf\n' "$n"
+  done
+  return 0
+}
+
+install_hook() {
+  local h="$STATE/githooks" sh=/bin/sh
+  is_termux && [ -x "$(tx_prefix)/bin/sh" ] && sh="$(tx_prefix)/bin/sh"
+  mkdir -p "$h"
+  gitc config core.hooksPath "$h" >/dev/null 2>&1
+  gitc config gpg.format ssh >/dev/null 2>&1
+  gitc config user.signingkey "$STATE/key.pub" >/dev/null 2>&1
+  gitc config commit.gpgsign true >/dev/null 2>&1
+  gitc config gpg.ssh.allowedSignersFile "$AS" >/dev/null 2>&1
+  { printf '#!%s\n' "$sh"
+    printf 'unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX\n'
+    printf 'exec %q confcheck\n' "$SELF"
+  } > "$h/pre-receive"
+  chmod 700 "$h/pre-receive"
+  { printf '#!%s\nexec >/dev/null 2>&1 </dev/null\n' "$sh"
+    printf 'unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX\n'
+    printf 'unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY\n'
+    printf 'unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PUSH_CERT\n'
+    printf 'export GIT_DIR GIT_WORK_TREE\n'
+    printf '%q compile\n' "$SELF"
+    printf '( setsid %q sync & ) 2>/dev/null || ( %q sync & )\n' "$SELF" "$SELF"
+  } > "$h/post-receive"
+  chmod 700 "$h/post-receive"
+}
+
+cmd_sync() {
+  conf_is_repo || { log "conf is not a git repo (run mesh init here)"; return 1; }
+  local out br u got=0 sent=0
+  exec 6>"$STATE/sync.lock"
+  flock -n 6 || { exec 6>&-; return 0; }
+  br=$(gitc symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$br" ] || br=main
+  gitc config receive.denyCurrentBranch updateInstead >/dev/null 2>&1
+  install_hook
+  gitc add -A >/dev/null 2>&1
+  if ! gitc diff --cached --quiet 2>/dev/null; then
+    if out=$(gitc commit -q --no-verify -m auto 2>&1); then
+      log "conf committed"
+    else
+      log "conf commit failed: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+      exec 6>&-
+      return 1
+    fi
+  fi
+  for u in $(conf_peers); do
+    GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentityFile=$TID -o IdentitiesOnly=yes" gitc fetch -q "$u" "$br" \
+      >/dev/null 2>&1 || continue
+    got=$((got + 1))
+    gitc merge -q --no-edit FETCH_HEAD >/dev/null 2>&1 && continue
+    gitc merge --abort >/dev/null 2>&1
+    log "conf merge conflict from $u, left alone"
+  done
+  for u in $(conf_peers); do
+    GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentityFile=$TID -o IdentitiesOnly=yes" gitc push -q "$u" \
+      "HEAD:refs/heads/$br" >/dev/null 2>&1 && sent=$((sent + 1))
+  done
+  [ "$got" -eq 0 ] && [ "$sent" -eq 0 ] && \
+    log "conf sync reached no peers (offline, or none authorized yet)"
+  exec 6>&-
+  return 0
+}
+
+cmd_confcheck() {
+  local old new ref sha signer paths pth owner rng asig bad=0
+  conf_is_repo || exit 0
+  [ "${MESH_CONF_ACL:-1}" = 1 ] || exit 0
+  while read -r old new ref; do
+    [ -n "$new" ] || continue
+    case "$new" in *[!0]*) ;; *) continue ;; esac
+    case "$old" in
+      *[!0]*) rng="$old..$new" ;;
+      *) rng="$new" ;;
+    esac
+    for sha in $(gitc rev-list --no-merges "$rng" 2>/dev/null); do
+      signer=$(gitc show --no-patch --format=%GS "$sha" 2>/dev/null)
+      paths=$(gitc diff-tree --no-commit-id --name-only -r "$sha" 2>/dev/null)
+      for pth in $paths; do
+        case "$pth" in
+          admins)
+            if [ -f "$ADMINS" ]; then
+              asig=$(gitc -c "gpg.ssh.allowedSignersFile=$ADMINS" show \
+                --no-patch --format='%G?%GS' "$sha" 2>/dev/null)
+              case "$asig" in
+                G?*) continue ;;
+              esac
+              echo "mesh: REJECTED conf/admins: not signed by a current admin key" >&2
+              bad=1
+            elif [ -n "$signer" ] && [ -f "$CONF/keys/$signer.pub" ]; then
+              continue
+            else
+              echo "mesh: REJECTED conf/admins: bootstrap must come from a member" >&2
+              bad=1
+            fi
+            continue
+            ;;
+          operators)
+            if [ -f "$ADMINS" ]; then
+              asig=$(gitc -c "gpg.ssh.allowedSignersFile=$ADMINS" show \
+                --no-patch --format='%G?%GS' "$sha" 2>/dev/null)
+              case "$asig" in
+                G?*) continue ;;
+              esac
+            fi
+            echo "mesh: REJECTED conf/operators: not signed by a current admin key" >&2
+            bad=1
+            continue
+            ;;
+          nodes/*.conf) owner=${pth#nodes/}; owner=${owner%.conf} ;;
+          keys/*.pub|hostkeys/*.pub) owner=${pth#*/}; owner=${owner%.pub} ;;
+          *) continue ;;
+        esac
+        [ "$signer" = "$owner" ] && continue
+        if [ ! -f "$CONF/keys/$owner.pub" ] && [ -n "$signer" ] &&
+            [ -f "$CONF/keys/$signer.pub" ]; then
+          continue
+        fi
+        echo "mesh: REJECTED $pth in ${sha%%??????????????????????????????????}..: only '$owner' may write it, commit signed by '${signer:-nobody}'" >&2
+        bad=1
+      done
+    done
+  done
+  [ "$bad" -eq 0 ] || exit 1
+  exit 0
+}
+
+cmd_serve() {
+  local c=${SSH_ORIGINAL_COMMAND:-} v a p
+  ensure_dirs
+  set -- $c
+  v=${1:-}
+  case "$v" in
+    recs)
+      tar -C "$STATE/records" -cf - . 2>/dev/null
+      ;;
+    drop)
+      tar -C "$STATE/in" -xf - 2>/dev/null
+      merge_in
+      ;;
+    probe)
+      a=${2:-}
+      p=${3:-}
+      case "$p" in ''|*[!0-9]*) exit 1 ;; esac
+      case "$a" in ''|*[!0-9a-fA-F.:]*) exit 1 ;; esac
+      port_open "$a" "$p" || exit 1
+      ;;
+    true)
+      ;;
+    git-upload-pack|git-receive-pack)
+      case "$c" in
+        "$v '.config/mesh/conf'"|"$v .config/mesh/conf") ;;
+        *) log "serve: refused $c"; exit 1 ;;
+      esac
+      exec git "${v#git-}" ".config/mesh/conf"
+      ;;
+    *)
+      log "serve: refused ${c:-<shell request>}"
+      exit 1
+      ;;
+  esac
+  exit 0
+}
+
+cmd_operator() {
+  local name="" keyf="" as="" key tmp remove=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) as=$2; shift 2 ;;
+      --remove) remove=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$name" ]; then name=$1; else keyf=$1; fi; shift ;;
+    esac
+  done
+  ensure_dirs
+  if [ -z "$name" ]; then
+    if [ -s "$OPERATORS" ]; then
+      printf 'operators:\n'
+      awk '{printf "  %s %s...\n", $1, substr($3,1,24)}' "$OPERATORS"
+    else
+      printf 'no conf/operators; shells use each device key\n'
+    fi
+    return 0
+  fi
+  [ -n "$keyf" ] || [ "$remove" -eq 1 ] || \
+    die "usage: mesh operator [<name> <pubkey-file>] [--as <admin>]
+     mesh operator <name> --remove [--as <admin>]"
+  if [ "$remove" -eq 1 ]; then
+    grep -q "^$name " "$OPERATORS" 2>/dev/null || die "no operator '$name'"
+  else
+    [ -f "$keyf" ] || die "no such pubkey file: $keyf"
+    key=$(cut -d' ' -f1,2 "$keyf")
+    [ -n "$key" ] || die "could not read a key from $keyf"
+  fi
+  [ -f "$ADMINS" ] || die "no conf/admins yet; run 'mesh admin' first, or an
+     operator could be added by any member key"
+  [ -n "$as" ] || as=$(awk '{print $1; exit}' "$ADMINS")
+  tmp="$STATE/tmp/adm.$$.pub"
+  awk -v p="$as" '$1==p{print $2" "$3}' "$ADMINS" > "$tmp"
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "admin '$as' is not in conf/admins"; }
+  touch "$OPERATORS"
+  grep -v "^$name " "$OPERATORS" > "$OPERATORS.t" 2>/dev/null || true
+  [ "$remove" -eq 1 ] || printf '%s %s\n' "$name" "$key" >> "$OPERATORS.t"
+  sort -o "$OPERATORS" "$OPERATORS.t"
+  rm -f "$OPERATORS.t"
+  if conf_is_repo; then
+    gitc add operators >/dev/null 2>&1
+    if ! gitc -c "user.signingkey=$tmp" commit -q --no-verify -m auto \
+        >/dev/null 2>&1; then
+      rm -f "$tmp"
+      die "could not sign the operators change with '$as' (is its key in your agent?)"
+    fi
+    log "committed, signed by admin '$as'"
+  fi
+  rm -f "$tmp"
+  if [ "$remove" -eq 1 ]; then
+    log "operator '$name' removed; it loses access at each node's next compile"
+    return 0
+  fi
+  log "operator '$name' recorded in conf/operators"
+  log "its key is authorized on every member regardless of groups or allow,"
+  log "so it is also the way back in if a policy change locks you out"
+}
+
+cmd_admin() {
+  local name="" keyf="" as="" key tmp existing=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) as=$2; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$name" ]; then name=$1; else keyf=$1; fi; shift ;;
+    esac
+  done
+  ensure_dirs
+  set -- "$name" "$keyf"
+  if [ -z "$name" ]; then
+    if [ -f "$ADMINS" ]; then
+      printf 'admins:\n'
+      awk '{printf "  %s %s...\n", $1, substr($3,1,24)}' "$ADMINS"
+      groups_verified && printf 'groups file: signature OK\n' || \
+        printf 'groups file: MISSING or UNVERIFIED (no groups are honoured)\n'
+    else
+      printf 'no conf/admins yet; groups are self-declared per node\n'
+    fi
+    return 0
+  fi
+  [ -n "$name" ] && [ -n "$keyf" ] || die "usage: mesh admin [<name> <pubkey-file>] [--as <admin>]"
+  [ -f "$keyf" ] || die "no such pubkey file: $keyf"
+  key=$(cut -d' ' -f1,2 "$keyf")
+  [ -n "$key" ] || die "could not read a key from $keyf"
+  [ -f "$ADMINS" ] && existing=1
+  if [ "$existing" -eq 1 ]; then
+    [ -n "$as" ] || as=$(awk '{print $1; exit}' "$ADMINS")
+    tmp="$STATE/tmp/adm.$$.pub"
+    awk -v p="$as" '$1==p{print $2" "$3}' "$ADMINS" > "$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; die "admin '$as' is not in conf/admins"; }
+  fi
+  touch "$ADMINS"
+  grep -v "^$name " "$ADMINS" > "$ADMINS.t" 2>/dev/null || true
+  printf '%s %s\n' "$name" "$key" >> "$ADMINS.t"
+  sort -o "$ADMINS" "$ADMINS.t"
+  rm -f "$ADMINS.t"
+  if conf_is_repo; then
+    gitc add admins >/dev/null 2>&1
+    if [ "$existing" -eq 1 ]; then
+      if ! gitc -c "user.signingkey=$tmp" commit -q --no-verify -m auto \
+          >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "could not sign the admins change with '$as' (is its key in your agent?)"
+      fi
+      rm -f "$tmp"
+      log "committed, signed by existing admin '$as'"
+    else
+      gitc commit -q --no-verify -m auto >/dev/null 2>&1
+      log "bootstrap admin recorded (first one, signed by this node)"
+    fi
+  fi
+  log "admin '$name' recorded in conf/admins"
+  log "from now on only an admin-signed conf/groups is honoured;"
+  log "assign groups with: mesh group <node> <a,b> --as $name"
+}
+
+cmd_group() {
+  local as="" node="" grps="" tmp serial
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) as=$2; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$node" ]; then node=$1; else grps=$1; fi; shift ;;
+    esac
+  done
+  ensure_dirs
+  [ -f "$ADMINS" ] || die "no conf/admins yet (mesh admin <name> <pubkey-file>)"
+  if [ -z "$node" ]; then
+    groups_verified && cat "$GFILE" || log "no verified groups file"
+    return 0
+  fi
+  [ -n "$as" ] || as=$(awk '{print $1; exit}' "$ADMINS")
+  tmp="$STATE/tmp/adm.$$.pub"
+  awk -v p="$as" '$1==p{print $2" "$3}' "$ADMINS" > "$tmp"
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "admin '$as' is not in conf/admins"; }
+  serial=$(date +%s)
+  touch "$GFILE"
+  { printf 'serial %s\n' "$serial"
+    grep -v "^serial " "$GFILE" 2>/dev/null | grep -v "^$node " || true
+    [ -n "$grps" ] && printf '%s %s\n' "$node" "$grps"
+  } > "$GFILE.t"
+  mv "$GFILE.t" "$GFILE"
+  rm -f "$GSIG"
+  if ! ssh-keygen -Y sign -f "$tmp" -n "$NSG" "$GFILE" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "signing failed. The admin private key must be on disk next to the
+     pubkey, or loaded in an ssh-agent this process can reach."
+  fi
+  rm -f "$tmp"
+  printf '%s\n' "$serial" > "$STATE/groups-serial"
+  log "assigned '$node' groups '${grps:-none}', signed by $as (serial $serial)"
+  compile_ak
+  conf_is_repo && cmd_sync
+}
+
+cmd_allow() {
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  if [ $# -eq 0 ]; then
+    printf 'allow: %s\n' "$(my_allow)"
+    printf 'groups: %s\n' "$(node_get "$(me)" groups)"
+    return 0
+  fi
+  [ "$1" = "*" ] || valid_grouplist "$1" || \
+    die "allow takes '*' or comma-separated group names, got '$1'"
+  printf '%s\n' "$1" > "$STATE/allow"
+  compile_ak
+  log "allow set to '$1' (local only, never gossiped); authorized_keys recompiled"
+}
+
+cmd_refresh() {
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  conf_is_repo && cmd_sync
+  gen_as
+  gen_kh
+  compile_ak
+  compile_sc
+}
+
+cmd_announce() {
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  exec 5>"$STATE/announce.lock"
+  flock -n 5 || { exec 5>&-; return 0; }
+  gen_as
+  gen_kh
+  cmd_publish
+  exchange
+  conf_is_repo && cmd_sync
+  compile_ak
+  compile_sc
+  exec 5>&-
+}
+
+ak_rest() {
+  sed "\|^$B1\$|,\|^$B2\$|d" "$AK" 2>/dev/null | grep -v '^[[:space:]]*$'
+}
+
+ak_drift() {
+  [ -f "$STATE/ak.base" ] || return 1
+  [ "$(sha256 "$(ak_rest)")" != "$(cat "$STATE/ak.base")" ]
+}
+
+ak_check() {
+  if [ ! -f "$STATE/ak.base" ]; then
+    sha256 "$(ak_rest)" > "$STATE/ak.base"
+    return 0
+  fi
+  ak_drift || return 0
+  log "WARNING: authorized_keys changed outside the managed block"
+  log "inspect $AK, then accept with: rm $STATE/ak.base"
+  command -v termux-notification >/dev/null 2>&1 && \
+    timeout 30 termux-notification --id mesh-ak --group mesh \
+      --title "mesh: authorized_keys drift" \
+      --content "unmanaged keys changed on $(me)" >/dev/null 2>&1
+  return 0
+}
+
+managed_write() {
+  local file=$1 content=$2 t="$STATE/tmp/mw.$$"
+  touch "$file"
+  chmod 600 "$file"
+  sed "\|^$B1\$|,\|^$B2\$|d" "$file" > "$t"
+  if [ -n "$content" ]; then
+    { printf '%s\n%s\n%s\n' "$B1" "$content" "$B2"; cat "$t"; } > "$file"
+  else
+    cat "$t" > "$file"
+  fi
+  rm -f "$t"
+}
+
+compile_ak() {
+  local m n out="" opts=""
+  m=$(me)
+  [ -n "$(node_get "$m" static)" ] && \
+    opts='restrict,port-forwarding,command="internal-sftp" '
+  [ "$(node_get "$m" restricted)" = 1 ] && \
+    opts="restrict,port-forwarding,command=\"$SELF serve\" "
+  for n in $(nodes); do
+    [ -n "$(node_get "$n" static)" ] && continue
+    [ -f "$CONF/keys/$n.pub" ] || continue
+    if [ "$n" != "$m" ] && ! allowed_in "$n"; then continue; fi
+    out+="$opts$(cat "$CONF/keys/$n.pub")"$'\n'
+  done
+  if [ -s "$OPERATORS" ]; then
+    while read -r _ t k; do
+      [ -n "$k" ] && out+="$t $k"$'\n'
+    done < "$OPERATORS"
+  fi
+  managed_write "$AK" "$out"
+}
+
+stanza() {
+  local alias=$1 n=$2 extra=$3 user
+  user=$(node_get "$n" user)
+  case "$user" in ''|*[!a-zA-Z0-9._-]*)
+    log "skipping $alias: bad or missing user="
+    return 1
+    ;;
+  esac
+  printf 'Host %s\n' "$alias"
+  printf '  User %s\n  HostKeyAlias %s\n  UserKnownHostsFile %s\n' "$user" "$n" "$KH"
+  printf '  StrictHostKeyChecking yes\n'
+  if is_member "$n" && [ "$(node_get "$n" restricted)" = 1 ]; then
+    printf '  IdentitiesOnly no\n'
+  elif is_member "$n" || [ "$(node_get "$n" identity)" = 1 ]; then
+    printf '  IdentityFile %s\n  IdentitiesOnly yes\n' "$TID"
+  fi
+  printf '  ProxyCommand %s dial %s\n' "$SELF" "$n"
+  if [ "$alias" = "$n" ]; then
+    printf '  ControlMaster auto\n  ControlPath %s/cm-%%n\n  ControlPersist 30\n' "$STATE"
+  else
+    printf '  ControlMaster no\n  ControlPath none\n  ExitOnForwardFailure yes\n'
+  fi
+  printf '  ServerAliveInterval 15\n  ServerAliveCountMax 4\n'
+  [ -n "$extra" ] && printf '%s\n' "$extra"
+  return 0
+}
+
+stanza_self() {
+  local m=$1 user port
+  user=$(node_get "$m" user)
+  port=$(node_get "$m" port)
+  case "$user" in ''|*[!a-zA-Z0-9._-]*) return 1 ;; esac
+  printf 'Host %s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n' "$m" "$port" "$user"
+  printf '  HostKeyAlias %s\n  UserKnownHostsFile %s\n  StrictHostKeyChecking yes\n' "$m" "$KH"
+  printf '  IdentityFile %s\n  IdentitiesOnly yes\n' "$STATE/key"
+}
+
+compile_sc() {
+  local n block="" st sfx lp rh rp
+  st=$(stanza_self "$(me)") && block+="$st"$'\n\n'
+  for n in $(peers); do
+    st=$(stanza "$n" "$n" "") && block+="$st"$'\n\n'
+    while IFS=: read -r sfx lp rh rp; do
+      [ -n "$sfx" ] && [ -n "$rh" ] || continue
+      case "$lp" in ''|*[!0-9]*) continue ;; esac
+      case "$rp" in ''|*[!0-9]*) continue ;; esac
+      st=$(stanza "$n-$sfx" "$n" \
+        "  LocalForward 127.0.0.1:$lp $rh:$rp") && block+="$st"$'\n\n'
+    done < <(node_get_all "$n" fwd)
+  done
+  managed_write "$SC" "$block"
+}
+
+cmd_publish() {
+  local m f a s rp b
+  m=$(me)
+  f="$STATE/records/$m.rec"
+  s=$(node_get "$m" static)
+  rp=$(node_get "$m" rport)
+  { printf 'name=%s\nseq=%s\n' "$m" "$(date +%s)"
+    for a in $(p_addrs); do printf 'ep=%s\n' "$a"; done
+    [ -n "$s" ] && printf 'ep=%s\n' "$s"
+    if [ -n "$rp" ] && [ -z "$s" ]; then
+      for b in $(boards); do
+        [ "$b" = "$m" ] && continue
+        case "$(cat "$STATE/roster/$b" 2>/dev/null)" in
+          ''|via\ *) continue ;;
+        esac
+        printf 'via=%s:%s\n' "$b" "$rp"
+      done
+    fi
+  } > "$f"
+  rm -f "$f.sig"
+  if ! ssh-keygen -Y sign -f "$STATE/key.pub" -n "$NS" "$f" >/dev/null 2>&1; then
+    rm -f "$f"
+    log "record signing failed (no key on disk and none in the agent), skipping publish"
+    return 1
+  fi
+  [ -n "$s" ] && cp "$f" "$f.sig" "$STATE/board/"
+  return 0
+}
+
+merge_guest_record() {
+  local f=$1 g by sq old
+  g=$(awk -F= '$1=="guest"{print $2;exit}' "$f")
+  by=$(awk -F= '$1=="by"{print $2;exit}' "$f")
+  case "$g" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+  case "$by" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+  [ -f "$CONF/keys/$by.pub" ] || return 1
+  ssh-keygen -Y verify -f "$AS" -I "$by" -n "$NS" -s "$f.sig" \
+    < "$f" >/dev/null 2>&1 || { log "bad signature on guest record from $by"; return 1; }
+  sq=$(awk -F= '$1=="seq"{print $2;exit}' "$f")
+  old=$(awk -F= '$1=="seq"{print $2;exit}' "$STATE/records/guest-$g.rec" 2>/dev/null)
+  if [ "${sq:-0}" -gt "${old:-0}" ] 2>/dev/null; then
+    mv "$f" "$STATE/records/guest-$g.rec"
+    mv "$f.sig" "$STATE/records/guest-$g.rec.sig"
+    return 0
+  fi
+  return 1
+}
+
+merge_in() {
+  local f n sq old
+  for f in "$STATE/in"/*.rec; do
+    [ -f "$f" ] || continue
+    if grep -q '^guest=' "$f" 2>/dev/null; then
+      merge_guest_record "$f" || rm -f "$f" "$f.sig"
+      continue
+    fi
+    n=$(awk -F= '$1=="name"{print $2;exit}' "$f")
+    case "$n" in ''|*[!a-zA-Z0-9_-]*) rm -f "$f" "$f.sig"; continue ;; esac
+    [ "$n" = "$(me)" ] && { rm -f "$f" "$f.sig"; continue; }
+    [ -f "$CONF/keys/$n.pub" ] || { rm -f "$f" "$f.sig"; continue; }
+    if ! ssh-keygen -Y verify -f "$AS" -I "$n" -n "$NS" -s "$f.sig" \
+        < "$f" >/dev/null 2>&1; then
+      log "bad signature on record for $n, discarded"
+      rm -f "$f" "$f.sig"
+      continue
+    fi
+    sq=$(awk -F= '$1=="seq"{print $2;exit}' "$f")
+    old=$(awk -F= '$1=="seq"{print $2;exit}' "$STATE/records/$n.rec" 2>/dev/null)
+    if [ "${sq:-0}" -gt "${old:-0}" ] 2>/dev/null; then
+      mv "$f" "$STATE/records/$n.rec"
+      mv "$f.sig" "$STATE/records/$n.rec.sig"
+    else
+      rm -f "$f" "$f.sig"
+    fi
+  done
+  rm -f "$STATE/in"/*
+}
+
+exchange() {
+  local m b n addr port user bf r
+  local -a popts
+  m=$(me)
+  [ -n "$(node_get "$m" static)" ] && return 0
+  for b in $(boards); do
+    [ "$b" = "$m" ] && continue
+    addr=$(board_addr "$b")
+    port=$(node_get "$b" port)
+    user=$(node_get "$b" user)
+    bf="$STATE/tmp/sftp.$b"
+    { printf -- '-mkdir %s\n' "$RBOARD"
+      printf -- 'put %s %s/\n' "$STATE/records/$m.rec" "$RBOARD"
+      printf -- 'put %s %s/\n' "$STATE/records/$m.rec.sig" "$RBOARD"
+      printf -- '-get %s/*.rec %s/\n' "$RBOARD" "$STATE/in"
+      printf -- '-get %s/*.rec.sig %s/\n' "$RBOARD" "$STATE/in"
+      printf -- '-mkdir .config/mesh/conf\n'
+      printf -- '-mkdir .config/mesh/conf/nodes\n'
+      printf -- '-mkdir .config/mesh/conf/keys\n'
+      printf -- '-mkdir .config/mesh/conf/hostkeys\n'
+      printf -- '-put %s/nodes/* .config/mesh/conf/nodes/\n' "$CONF"
+      printf -- '-put %s/keys/* .config/mesh/conf/keys/\n' "$CONF"
+      printf -- '-put %s/hostkeys/* .config/mesh/conf/hostkeys/\n' "$CONF"
+    } > "$bf"
+    if sftp -b "$bf" -P "$port" "${SOPTS[@]}" -o "HostKeyAlias=$b" \
+        "$user@$addr" >/dev/null 2>&1; then
+      log "board $b synced"
+    else
+      log "board $b unreachable"
+    fi
+    merge_in
+  done
+  for n in $(peers); do
+    is_member "$n" || continue
+    r=$(cat "$STATE/roster/$n" 2>/dev/null)
+    [ -n "$r" ] || continue
+    case "$r" in via\ *) continue ;; esac
+    port=$(node_get "$n" port)
+    user=$(node_get "$n" user)
+    popts=()
+    case "$r" in
+      jump\ *) popts=(-o "ProxyCommand=$SELF dial $n"); r=$n ;;
+    esac
+    ssh "${SOPTS[@]}" "${popts[@]}" -o "HostKeyAlias=$n" -p "$port" \
+      "$user@$r" recs </dev/null 2>/dev/null |
+      tar -C "$STATE/in" -xf - 2>/dev/null
+    merge_in
+  done
+}
+
+ident() {
+  local a=$1 p=$2 t k f hk
+  ssh-keyscan -T "$CTO" -p "$p" "$a" 2>/dev/null | while read -r _ t k; do
+    for f in "$CONF/hostkeys"/*.pub; do
+      [ -f "$f" ] || continue
+      hk=$(cut -d' ' -f1,2 "$f")
+      if [ "$hk" = "$t $k" ]; then
+        f=${f##*/}
+        printf '%s\n' "${f%.pub}"
+      fi
+    done
+  done | sort -u
+}
+
+relay_probe() {
+  local b=$1 baddr=$2 a=$3 p=$4 bport buser
+  bport=$(node_get "$b" port)
+  buser=$(node_get "$b" user)
+  timeout "$((CTO * 3))" ssh "${SOPTS[@]}" -o "HostKeyAlias=$b" -p "$bport" \
+    "$buser@$baddr" "probe $a $p" </dev/null >/dev/null 2>&1
+}
+
+resolve_one() {
+  local n=$1 port cands ordered r s a sq now b p baddr bport
+  now=$(date +%s)
+  port=$(node_get "$n" port)
+  cands=""
+  r=$(cat "$STATE/roster/$n" 2>/dev/null)
+  case "$r" in via\ *|'') ;; *) cands="$r" ;; esac
+  s=$(node_get "$n" static)
+  [ -n "$s" ] && cands="$cands $s"
+  [ -f "$STATE/records/$n.rec" ] && \
+    cands="$cands $(awk -F= '$1=="ep"{print $2}' "$STATE/records/$n.rec" | tr '\n' ' ')"
+  cands=$(printf '%s\n' $cands | awk '!x[$0]++')
+  ordered=""
+  for a in $cands; do is_private "$a" && ordered="$ordered $a"; done
+  for a in $cands; do is_private "$a" || ordered="$ordered $a"; done
+  for a in $ordered; do
+    port_open "$a" "$port" || continue
+    ident "$a" "$port" | grep -qx "$n" || continue
+    printf '%s\n' "$a" > "$STATE/roster/$n"
+    log "$n direct at $a"
+    return 0
+  done
+  if [ -f "$STATE/records/$n.rec" ]; then
+    sq=$(awk -F= '$1=="seq"{print $2;exit}' "$STATE/records/$n.rec")
+    if [ $((now - ${sq:-0})) -le "$TTL" ]; then
+      while IFS=: read -r b p; do
+        baddr=$(board_addr "$b")
+        bport=$(node_get "$b" port)
+        [ -n "$baddr" ] || continue
+        port_open "$baddr" "$bport" || continue
+        printf 'via %s %s\n' "$b" "$p" > "$STATE/roster/$n"
+        log "$n via $b port $p"
+        return 0
+      done < <(awk -F= '$1=="via"{print $2}' "$STATE/records/$n.rec")
+    fi
+  fi
+  for b in $(peers); do
+    [ "$b" = "$n" ] && continue
+    is_member "$b" || continue
+    baddr=$(cat "$STATE/roster/$b" 2>/dev/null)
+    case "$baddr" in ''|via\ *|jump\ *) continue ;; esac
+    for a in $ordered; do
+      relay_probe "$b" "$baddr" "$a" "$port" || continue
+      printf 'jump %s %s %s\n' "$b" "$baddr" "$a" > "$STATE/roster/$n"
+      log "$n relayed through $b at $a"
+      return 0
+    done
+  done
+  rm -f "$STATE/roster/$n"
+  return 1
+}
+
+resolve() {
+  local n
+  for n in $(ordered_peers); do
+    is_member "$n" || continue
+    resolve_one "$n" || true
+  done
+  for n in $(ordered_peers); do
+    is_member "$n" || continue
+    [ -f "$STATE/roster/$n" ] && continue
+    resolve_one "$n" || log "$n unreachable"
+  done
+  return 0
+}
+
+sweep() {
+  command -v nmap >/dev/null 2>&1 || return 0
+  local m n missing="" subs ports ip p nm hit
+  m=$(me)
+  for n in $(peers); do
+    is_member "$n" || continue
+    [ -f "$STATE/roster/$n" ] || missing="$missing $n"
+  done
+  [ -n "${missing// /}" ] || return 0
+  subs=$(p_addrs | sed 's/\.[0-9]*$/.0\/24/' | sort -u | tr '\n' ' ')
+  [ -n "${subs// /}" ] || return 0
+  ports=$(for n in $(nodes); do node_get "$n" port; done | sort -un | paste -sd, -)
+  log "sweeping $subs for$missing"
+  while read -r ip; do
+    for p in ${ports//,/ }; do
+      port_open "$ip" "$p" || continue
+      hit=""
+      for nm in $(ident "$ip" "$p"); do
+        [ "$nm" = "$m" ] && continue
+        is_member "$nm" || continue
+        printf '%s\n' "$ip" > "$STATE/roster/$nm"
+        log "found $nm at $ip"
+        hit=1
+      done
+      [ -n "$hit" ] && break
+    done
+  done < <(nmap -p"$ports" --open -oG - $subs 2>/dev/null |
+    awk '/Host:/{print $2}' | sort -u)
+}
+
+tunnels() {
+  local m rp b pidf pid
+  m=$(me)
+  rp=$(node_get "$m" rport)
+  [ -n "$rp" ] || return 0
+  [ -n "$(node_get "$m" static)" ] && return 0
+  for b in $(boards); do
+    [ "$b" = "$m" ] && continue
+    pidf="$STATE/tunnels/$b.pid"
+    pid=$(cat "$pidf" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+    "$SELF" tunnel "$b" >/dev/null 2>&1 9>&- &
+    printf '%s\n' "$!" > "$pidf"
+    disown "$!" 2>/dev/null
+    log "tunnel supervisor for $b started (pid $!)"
+  done
+}
+
+cmd_tunnel() {
+  local b=$1 m rp myport addr port user child
+  [ -n "$b" ] || die "usage: mesh tunnel <board>"
+  m=$(me)
+  rp=$(node_get "$m" rport)
+  myport=$(node_get "$m" port)
+  [ -n "$rp" ] && [ -n "$myport" ] || exit 0
+  ensure_dirs
+  exec 7>"$STATE/tunnels/$b.lock"
+  flock -n 7 || exit 0
+  trap '[ -n "$child" ] && kill "$child" 2>/dev/null' EXIT
+  while :; do
+    [ -n "$(node_get "$m" static)" ] && exit 0
+    addr=$(board_addr "$b")
+    port=$(node_get "$b" port)
+    user=$(node_get "$b" user)
+    [ -n "$addr" ] || exit 0
+    ssh "${SOPTS[@]}" -o "HostKeyAlias=$b" -o ExitOnForwardFailure=yes \
+      -o "ServerAliveInterval=$(alive_interval)" -o ServerAliveCountMax=3 -p "$port" -N \
+      -R "127.0.0.1:$rp:127.0.0.1:$myport" "$user@$addr" >/dev/null 2>&1 7>&- &
+    child=$!
+    sleep 5
+    if kill -0 "$child" 2>/dev/null; then
+      log "tunnel to $b up, announcing"
+      "$SELF" announce >/dev/null 2>&1 7>&- &
+    fi
+    wait "$child"
+    child=""
+    sleep "${MESH_RETUNNEL:-30}"
+  done
+}
+
+pipe_to() {
+  local n=$1 r=$2 port=$3 b p baddr bport buser cp
+  local -a jopts
+  case "$r" in
+    jump\ *)
+      set -- $r
+      b=$2
+      baddr=$3
+      p=$4
+      bport=$(node_get "$b" port)
+      buser=$(node_get "$b" user)
+      if is_member "$b" || [ "$(node_get "$b" identity)" = 1 ]; then
+        jopts=("${SOPTS[@]}")
+      else
+        jopts=("${GOPTS[@]}")
+      fi
+      exec ssh "${jopts[@]}" -o "HostKeyAlias=$b" -p "$bport" \
+        -W "$p:$port" "$buser@$baddr"
+      ;;
+    via\ *)
+      set -- $r
+      b=$2
+      p=$3
+      baddr=$(board_addr "$b")
+      bport=$(node_get "$b" port)
+      buser=$(node_get "$b" user)
+      exec ssh "${SOPTS[@]}" -o "HostKeyAlias=$b" -p "$bport" \
+        -W "127.0.0.1:$p" "$buser@$baddr"
+      ;;
+    *)
+      if command -v nc >/dev/null 2>&1; then
+        exec nc "$r" "$port"
+      fi
+      port_open "$r" "$port" || die "connect to $n failed"
+      exec 3<>"/dev/tcp/$r/$port"
+      cat <&3 &
+      cp=$!
+      cat >&3
+      kill "$cp" 2>/dev/null
+      ;;
+  esac
+}
+
+cmd_dial() {
+  local n=$1 r port baddr bport jump addr jaddr
+  [ -n "$n" ] || die "usage: mesh dial <peer>"
+  [ -f "$CONF/nodes/$n.conf" ] || die "unknown peer: $n"
+  ensure_dirs
+  port=$(node_get "$n" port)
+  if ! is_member "$n"; then
+    jump=$(node_get "$n" jump)
+    if [ -z "$jump" ]; then
+      addr=$(guest_addr "$n") || die "resolver for $n failed"
+      [ -n "$addr" ] || die "no address for $n"
+      pipe_to "$n" "$addr" "$port"
+      exit 0
+    fi
+    [ -f "$CONF/nodes/$jump.conf" ] || die "unknown jump node: $jump"
+    addr=$(node_get "$n" static)
+    [ -n "$addr" ] || die "no address for $n"
+    jaddr=$(guest_addr "$jump") || \
+      die "jump $jump unresolvable (is it launched?)"
+    [ -n "$jaddr" ] || die "jump $jump has no address"
+    pipe_to "$n" "jump $jump $jaddr $addr" "$port"
+    exit 0
+  fi
+  r=$(cat "$STATE/roster/$n" 2>/dev/null)
+  case "$r" in
+    '') ;;
+    via\ *)
+      set -- $r
+      baddr=$(board_addr "$2")
+      bport=$(node_get "$2" port)
+      { [ -n "$baddr" ] && port_open "$baddr" "$bport"; } || r=""
+      ;;
+    jump\ *)
+      set -- $r
+      bport=$(node_get "$2" port)
+      port_open "$3" "$bport" || r=""
+      ;;
+    *)
+      port_open "$r" "$port" || r=""
+      ;;
+  esac
+  if [ -z "$r" ]; then
+    log "no live route to $n, re-resolving"
+    if ! resolve_one "$n"; then
+      exchange
+      resolve_one "$n" || sweep
+    fi
+    r=$(cat "$STATE/roster/$n" 2>/dev/null)
+  fi
+  [ -n "$r" ] || die "cannot reach $n"
+  rm -f "$STATE/last-error"
+  pipe_to "$n" "$r" "$port"
+}
+
+cmd_init() {
+  local name="" static="" port="" user="" rport="" token="" groups="" allow=""
+  local old n e mx hk joining=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --static) static=$2; shift 2 ;;
+      --port) port=$2; shift 2 ;;
+      --user) user=$2; shift 2 ;;
+      --rport) rport=$2; shift 2 ;;
+      --token) token=$2; shift 2 ;;
+      --groups) groups=$2; shift 2 ;;
+      --allow) allow=$2; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: mesh init <new-name> [--static addr] [--port p] [--user u] [--rport p]"
+  case "$name" in *[!a-zA-Z0-9_-]*) die "name must be [a-zA-Z0-9_-]" ;; esac
+  old=$(me)
+  [ -n "$old" ] && [ "$old" != "$name" ] && die "already initialized as $old"
+  have_git || die "git is required (pkg install git / apt install git)"
+  ensure_dirs
+  ls "$CONF"/keys/*.pub >/dev/null 2>&1 && joining=1
+  if ! conf_is_repo; then
+    if [ "$joining" -eq 0 ]; then
+      log "no conf here, so this starts a BRAND NEW mesh."
+      log "to join an existing one instead, stop now, copy a member's"
+      log "~/.config/mesh/conf here (with its .git), and re-run."
+    fi
+    gitc init -q -b main
+  fi
+  gitc config user.name "$name"
+  gitc config user.email "$name@mesh"
+  gitc config receive.denyCurrentBranch updateInstead
+  install_hook
+  [ -n "$port" ] || { is_termux && port=8022 || port=22; }
+  [ -n "$user" ] || user=$(id -un)
+  case "$port" in ''|*[!0-9]*) die "port must be numeric" ;; esac
+  case "$user" in ''|*[!a-zA-Z0-9._-]*) die "user must be [a-zA-Z0-9._-]" ;; esac
+  if [ -z "$rport" ] && [ -z "$static" ]; then
+    mx=22000
+    for n in $(nodes); do
+      e=$(node_get "$n" rport)
+      case "$e" in ''|*[!0-9]*) continue ;; esac
+      [ "$e" -gt "$mx" ] && mx=$e
+    done
+    rport=$((mx + 1))
+  fi
+  [ -f "$STATE/key" ] || ssh-keygen -q -t ed25519 -N "" -f "$STATE/key" -C "$name" || \
+    die "keygen failed"
+  printf '%s\n' "$name" > "$STATE/name"
+  cp "$STATE/key.pub" "$CONF/keys/$name.pub"
+  { printf 'user=%s\nport=%s\n' "$user" "$port"
+    [ -n "$rport" ] && printf 'rport=%s\n' "$rport"
+    [ -n "$static" ] && printf 'static=%s\n' "$static"
+    [ -n "$groups" ] && printf 'groups=%s\n' "$groups"
+    [ -n "$token" ] && printf 'proof=%s\n' \
+      "$(sha256 "$token$(cut -d' ' -f2 "$STATE/key.pub")")"
+  } > "$CONF/nodes/$name.conf"
+  [ -n "$allow" ] && printf '%s\n' "$allow" > "$STATE/allow"
+  p_ensure_sshd || log "warning: sshd not confirmed on port $port"
+  if hk=$(p_hostkey_pub); then
+    printf '%s\n' "$hk" > "$CONF/hostkeys/$name.pub"
+  else
+    log "warning: no host key found, write $CONF/hostkeys/$name.pub yourself"
+  fi
+  gen_as
+  gen_kh
+  compile_ak
+  compile_sc
+  conf_is_repo && cmd_sync
+  log "initialized $name (user=$user port=$port${rport:+ rport=$rport}${static:+ static=$static})"
+  if [ "$joining" -eq 1 ]; then
+    for e in $(p_addrs); do
+      is_private "$e" || continue
+      log "to finish joining, run this on any existing member:"
+      log "  mesh adopt $user@$e --port $port"
+      break
+    done
+  fi
+  log "then: mesh schedule (without it this node goes stale to peers"
+  log "      and its tunnels do not come back after a reboot)"
+}
+
+cmd_guest() {
+  local name="" addr="" port=22 user="" jump="" rescmd="" fwds="" dynamic=0 hk fw
+  local identity=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port=$2; shift 2 ;;
+      --user) user=$2; shift 2 ;;
+      --jump) jump=$2; shift 2 ;;
+      --resolve) rescmd=$2; shift 2 ;;
+      --dynamic) dynamic=1; shift ;;
+      --identity) identity=1; shift ;;
+      --fwd) fwds="$fwds$2"$'\n'; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [ -z "$name" ]; then name=$1; else addr=$1; fi
+        shift
+        ;;
+    esac
+  done
+  [ -n "$name" ] || \
+    die "usage: mesh guest <name> [<addr>] [--port p] [--user u] [--jump n] [--resolve cmd] [--fwd sfx:lport:rhost:rport]"
+  [ -n "$addr" ] || [ -n "$rescmd" ] || [ "$dynamic" -eq 1 ] || \
+    die "need an address, --dynamic, or --resolve"
+  case "$name" in *[!a-zA-Z0-9_-]*) die "name must be [a-zA-Z0-9_-]" ;; esac
+  [ -f "$CONF/keys/$name.pub" ] && die "$name is a member, not a guest"
+  [ -n "$user" ] || user=$(id -un)
+  case "$port" in ''|*[!0-9]*) die "port must be numeric" ;; esac
+  case "$user" in ''|*[!a-zA-Z0-9._-]*) die "user must be [a-zA-Z0-9._-]" ;; esac
+  ensure_dirs
+  { printf 'user=%s\nport=%s\n' "$user" "$port"
+    [ -n "$addr" ] && printf 'static=%s\n' "$addr"
+    [ -n "$jump" ] && printf 'jump=%s\n' "$jump"
+    [ "$dynamic" -eq 1 ] && printf 'dynamic=1\n'
+    [ "$identity" -eq 1 ] && printf 'identity=1\n'
+    [ -n "$rescmd" ] && printf 'resolve=%s\n' "$rescmd"
+    while read -r fw; do
+      [ -n "$fw" ] && printf 'fwd=%s\n' "$fw"
+    done <<EOF
+$fwds
+EOF
+  } > "$CONF/nodes/$name.conf"
+  [ -n "$jump" ] && [ ! -f "$CONF/nodes/$jump.conf" ] && \
+    log "warning: jump node $jump not in conf yet"
+  if [ -f "$CONF/hostkeys/$name.pub" ]; then
+    log "host key already pinned, leaving it alone"
+    log "  $(ssh-keygen -lf "$CONF/hostkeys/$name.pub" 2>/dev/null)"
+  elif [ -n "$jump" ]; then
+    log "reached via $jump, so no direct keyscan; pin its host key with:"
+    log "  ssh $jump -- ssh-keyscan -T 5 $addr"
+    log "  then write the 'type key' fields into $CONF/hostkeys/$name.pub"
+  elif [ -n "$addr" ]; then
+    hk=$(ssh-keyscan -T "$CTO" -p "$port" "$addr" 2>/dev/null |
+      awk '$2=="ssh-ed25519"{print $2" "$3; exit}')
+    [ -n "$hk" ] || hk=$(ssh-keyscan -T "$CTO" -p "$port" "$addr" 2>/dev/null |
+      awk 'NF>=3{print $2" "$3; exit}')
+    if [ -n "$hk" ]; then
+      printf '%s\n' "$hk" > "$CONF/hostkeys/$name.pub"
+      log "pinned host key: $(ssh-keygen -lf "$CONF/hostkeys/$name.pub" 2>/dev/null)"
+      log "verify that fingerprint out of band"
+    else
+      log "warning: keyscan failed (firewalled?); pin the host key yourself:"
+      log "  ssh-keyscan -p $port $addr (from a host that can reach it)"
+      log "  then write 'type key' into $CONF/hostkeys/$name.pub"
+    fi
+  else
+    log "host key will be pinned by the resolver at first dial"
+    [ "$dynamic" -eq 1 ] && \
+      log "each device that should reach $name needs 'mesh-resolve-$name' on PATH"
+  fi
+  gen_kh
+  log "guest $name added ($user@${addr:-<resolved>}:$port${jump:+ via $jump})"
+  log "sync conf and run: mesh compile"
+}
+
+cmd_tick() {
+  [ -n "$(me)" ] || die "not initialized, run: mesh init <name>"
+  ensure_dirs
+  exec 9>"$STATE/lock"
+  flock -n 9 || { log "tick already running"; exit 0; }
+  local m dup
+  m=$(me)
+  dup=$(for n in $(nodes); do node_get "$n" rport; done |
+    grep -v '^$' | sort | uniq -d | tr '\n' ' ')
+  [ -n "${dup// /}" ] && log "warning: duplicate rport across nodes: $dup"
+  p_ensure_sshd || log "warning: sshd not confirmed"
+  conf_is_repo && { cmd_sync || log "continuing with local conf"; }
+  gen_as
+  gen_kh
+  compile_ak
+  cmd_publish
+  exchange
+  if [ -n "$(node_get "$m" static)" ]; then
+    cp "$STATE/board/"*.rec "$STATE/board/"*.rec.sig "$STATE/in/" 2>/dev/null
+    merge_in
+    cp "$STATE/records/"*.rec "$STATE/records/"*.rec.sig "$STATE/board/" 2>/dev/null
+  fi
+  resolve
+  sweep
+  tunnels
+  if [ -n "$(invites_active)" ]; then
+    log "invite outstanding, scanning for the new device"
+    adopt_scan 1
+  fi
+  conf_is_repo && cmd_sync
+  compile_ak
+  compile_sc
+  ak_check
+  log "roster: $(cd "$STATE/roster" 2>/dev/null && ls | tr '\n' ' ')"
+  unresolved_members || rm -f "$STATE/last-error"
+  exec 9>&-
+}
+
+adopt_gs() { printf 'ssh -p %s -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=%s -o IdentitiesOnly=yes -i %s' "$1" "$CTO" "$STATE/key"; }
+
+verify_proof() {
+  local n=$1 proof blob t
+  proof=$(gitc show "FETCH_HEAD:nodes/$n.conf" 2>/dev/null |
+    awk -F= '$1=="proof"{print $2; exit}')
+  [ -n "$proof" ] || return 1
+  blob=$(gitc show "FETCH_HEAD:keys/$n.pub" 2>/dev/null | cut -d' ' -f2)
+  [ -n "$blob" ] || return 1
+  for t in $(invites_active); do
+    if [ "$(sha256 "$t$blob")" = "$proof" ]; then
+      printf '%s\n' "$t"
+      return 0
+    fi
+  done
+  return 1
+}
+
+strip_proof() {
+  local f="$CONF/nodes/$1.conf" t="$STATE/tmp/np.$$"
+  [ -f "$f" ] || return 0
+  grep -q '^proof=' "$f" || return 0
+  grep -v '^proof=' "$f" > "$t" && mv "$t" "$f"
+}
+
+adopt_finish() {
+  if ! gitc merge -q --no-edit FETCH_HEAD >/dev/null 2>&1; then
+    gitc merge --abort >/dev/null 2>&1
+    log "histories differ (conf copied without .git?); importing theirs"
+    if ! gitc merge -q --no-edit --allow-unrelated-histories -X theirs \
+        FETCH_HEAD >/dev/null 2>&1; then
+      gitc merge --abort >/dev/null 2>&1
+      return 1
+    fi
+  fi
+  gen_as
+  gen_kh
+  compile_ak
+  compile_sc
+  return 0
+}
+
+adopt_scan() {
+  local auto=$1 br subs ports users ip p u n hit fp found=0 mine tok ok
+  have_git || die "git is required"
+  command -v nmap >/dev/null 2>&1 || die "nmap is required for --scan"
+  ensure_dirs
+  br=$(gitc symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$br" ] || br=main
+  users=$({ for n in $(nodes); do node_get "$n" user; done; id -un; } |
+    grep -v '^$' | sort -u | tr '\n' ' ')
+  ports=$({ for n in $(nodes); do node_get "$n" port; done; printf '22\n8022\n'; } |
+    grep -E '^[0-9]+$' | sort -un | paste -sd, -)
+  mine=$(p_addrs | tr '\n' ' ')
+  subs=$(p_addrs | sed 's/\.[0-9]*$/.0\/24/' | sort -u | tr '\n' ' ')
+  [ -n "${subs// /}" ] || die "no local subnets to scan"
+  log "scanning $subs on ports $ports"
+  while read -r ip; do
+    case " $mine " in *" $ip "*) continue ;; esac
+    for p in ${ports//,/ }; do
+      port_open "$ip" "$p" || continue
+      [ -n "$(ident "$ip" "$p")" ] && continue
+      for u in $users; do
+        GIT_SSH_COMMAND=$(adopt_gs "$p") gitc fetch -q "$u@$ip:.config/mesh/conf" \
+          "$br" >/dev/null 2>&1 || continue
+        hit=""
+        for n in $(gitc ls-tree --name-only FETCH_HEAD nodes/ 2>/dev/null |
+            sed 's|^nodes/||; s|\.conf$||'); do
+          [ -f "$CONF/nodes/$n.conf" ] || hit="$hit $n"
+        done
+        found=$((found + 1))
+        if [ -z "${hit// /}" ]; then
+          log "$u@$ip:$p answers but adds nothing new"
+          break
+        fi
+        log "found new node(s)$hit at $u@$ip:$p"
+        ok=""
+        for n in $hit; do
+          fp=$(gitc show "FETCH_HEAD:keys/$n.pub" 2>/dev/null |
+            ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+          if [ -z "$fp" ]; then
+            log "  guest $n (dial-only, no key)"
+            continue
+          fi
+          if tok=$(verify_proof "$n"); then
+            log "  member $n, key $fp, VALID INVITE"
+            ok="$ok $n:$tok"
+          else
+            log "  member $n, key $fp, no invite"
+          fi
+        done
+        if [ "$auto" = 1 ] && [ -n "${ok// /}" ]; then
+          if adopt_finish; then
+            for n in $ok; do
+              tok=${n#*:}
+              n=${n%%:*}
+              rm -f "$STATE/invites/$tok"
+              strip_proof "$n"
+              log "  adopted $n (invite burned)"
+            done
+            cmd_sync
+          else
+            log "  merge failed, not adopted"
+          fi
+        else
+          log "  adopt with: mesh adopt $u@$ip --port $p"
+        fi
+        break
+      done
+    done
+  done < <(nmap -p"$ports" --open -oG - $subs 2>/dev/null |
+    awk '/Host:/{print $2}' | sort -u)
+  [ "$found" -eq 0 ] && log "no un-enrolled mesh devices found"
+  return 0
+}
+
+cmd_adopt() {
+  local tgt="" port=22 br gs scan=0 auto=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --scan) scan=1; shift ;;
+      --auto) scan=1; auto=1; shift ;;
+      --port) port=$2; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) tgt=$1; shift ;;
+    esac
+  done
+  if [ "$scan" -eq 1 ]; then
+    [ -n "$(me)" ] || die "not initialized"
+    conf_is_repo || die "conf is not a git repo"
+    adopt_scan "$auto"
+    return 0
+  fi
+  [ -n "$tgt" ] || die "usage: mesh adopt <user@host> [--port p] | mesh adopt --scan"
+  case "$port" in ''|*[!0-9]*) die "port must be numeric" ;; esac
+  [ -n "$(me)" ] || die "not initialized"
+  conf_is_repo || die "conf is not a git repo"
+  ensure_dirs
+  br=$(gitc symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$br" ] || br=main
+  gs=$(adopt_gs "$port")
+  if ! GIT_SSH_COMMAND="$gs" gitc fetch -q "$tgt:.config/mesh/conf" "$br" \
+      >/dev/null 2>&1; then
+    die "could not fetch conf from $tgt (is it initialized, and does its
+     authorized_keys already list this node? run 'mesh refresh' there)"
+  fi
+  adopt_finish || die "conf merge from $tgt failed; copy the conf dir with .git"
+  cmd_sync
+  log "adopted conf from $tgt; new members are live here and gossiping onward"
+}
+
+cmd_reset() {
+  local all=0 f pid
+  [ "$1" = "--all" ] && all=1
+  ensure_dirs
+  for f in "$STATE"/tunnels/*.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill "$pid" 2>/dev/null && log "stopped tunnel supervisor pid $pid"
+  done
+  managed_write "$AK" ""
+  managed_write "$SC" ""
+  if command -v termux-job-scheduler >/dev/null 2>&1; then
+    termux-job-scheduler --cancel --job-id 3388 >/dev/null 2>&1
+  fi
+  rm -f "$HOME/.termux/boot/start-mesh.sh"
+  if have_systemd_user && [ -f "$HOME/.config/systemd/user/mesh.service" ]; then
+    systemctl --user disable --now mesh.service >/dev/null 2>&1
+    rm -f "$HOME/.config/systemd/user/mesh.service"
+    systemctl --user daemon-reload >/dev/null 2>&1
+    log "systemd user unit removed"
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -v "mesh daemon" | crontab - >/dev/null 2>&1
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -v "mesh tick" | grep -v "mesh refresh" |
+      crontab - >/dev/null 2>&1
+  fi
+  rm -rf "$STATE"
+  if [ "$all" -eq 1 ]; then
+    rm -rf "$CONF"
+    log "reset complete: state, conf, managed blocks, schedules all removed"
+  else
+    log "reset complete: state, managed blocks, schedules removed (conf kept)"
+  fi
+}
+
+cmd_status() {
+  local m n r f age pid port now
+  m=$(me) || die "not initialized"
+  [ -n "$m" ] || die "not initialized"
+  now=$(date +%s)
+  echo "node: $m"
+  if [ -n "$(node_get "$m" static)" ]; then
+    echo "role: board ($(node_get "$m" static))"
+  else
+    echo "role: roaming peer"
+  fi
+  port=$(node_get "$m" port)
+  if port_open 127.0.0.1 "$port"; then
+    echo "sshd: listening on $port"
+  else
+    echo "sshd: NOT listening on $port"
+  fi
+  echo "peers:"
+  for n in $(peers); do
+    if [ -f "$STATE/roster/$n" ]; then
+      r=$(cat "$STATE/roster/$n")
+      case "$r" in
+        jump\ *) set -- $r; r="$4 relayed through $2" ;;
+        via\ *) set -- $r; r="via board $2 port $3" ;;
+      esac
+      age=$(( (now - $(mtime "$STATE/roster/$n")) / 60 ))
+      printf '  %-12s %-28s %sm ago\n' "$n" "$r" "$age"
+    elif ! is_member "$n"; then
+      printf '  %-12s guest, dials on demand\n' "$n"
+    else
+      printf '  %-12s unreachable\n' "$n"
+    fi
+  done
+  echo "tunnels:"
+  for f in "$STATE/tunnels"/*.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f")
+    n=${f##*/}
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '  %-12s up (pid %s)\n' "${n%.pid}" "$pid"
+    else
+      printf '  %-12s down\n' "${n%.pid}"
+    fi
+  done
+  if ak_drift; then
+    echo "authorized_keys: UNMANAGED KEYS CHANGED (inspect, then rm $STATE/ak.base)"
+  fi
+  grep -q "^$B1\$" "$AK" 2>/dev/null && echo "authorized_keys: managed block present" || \
+    echo "authorized_keys: no managed block"
+  grep -q "^$B1\$" "$SC" 2>/dev/null && echo "ssh_config: managed block present" || \
+    echo "ssh_config: no managed block"
+  if [ -s "$STATE/last-error" ]; then
+    echo "last dial error:"
+    tail -2 "$STATE/last-error" | sed 's/^/  /'
+  fi
+}
+
+valid_grouplist() {
+  local t
+  case "$1" in ''|,*|*,|*,,*) return 1 ;; esac
+  case "$1" in *[!a-zA-Z0-9,_-]*) return 1 ;; esac
+  for t in ${1//,/ }; do
+    case "$t" in [a-zA-Z0-9_]*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+cmd_restrict() {
+  local off=0 f t m
+  case "${1:-}" in
+    '') ;;
+    --off) off=1 ;;
+    *) die "usage: mesh restrict [--off]" ;;
+  esac
+  m=$(me)
+  [ -n "$m" ] || die "not initialized"
+  ensure_dirs
+  f="$CONF/nodes/$m.conf"
+  if [ "$off" -eq 0 ] && [ ! -s "$OPERATORS" ]; then
+    die "no conf/operators, so restricting would leave no way to open a shell here.
+     record one first: mesh operator <name> <pubkey-file> --as <admin>"
+  fi
+  t="$STATE/tmp/rs.$$"
+  grep -v '^restricted=' "$f" > "$t"
+  [ "$off" -eq 1 ] || printf 'restricted=1\n' >> "$t"
+  mv "$t" "$f"
+  compile_ak
+  compile_sc
+  conf_is_repo && cmd_sync
+  if [ "$off" -eq 1 ]; then
+    log "unrestricted: member keys get a shell here again"
+  else
+    log "restricted: member keys reach only '$SELF serve' here."
+    log "shells now need an operator key from your agent."
+    log "peers use verbs once they see restricted=1, which rides the next sync."
+  fi
+}
+
+cmd_groups() {
+  local g=$1 f t
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  f="$CONF/nodes/$(me).conf"
+  if [ -z "$g" ]; then
+    printf '%s\n' "$(node_get "$(me)" groups)"
+    return 0
+  fi
+  [ -f "$ADMINS" ] && \
+    die "conf/admins exists, so groups are admin-assigned (mesh group <node> <a,b> --as <admin>)"
+  [ "$g" = "none" ] || valid_grouplist "$g" || \
+    die "groups must be comma-separated names starting [a-zA-Z0-9_], got '$g'"
+  t="$STATE/tmp/gr.$$"
+  grep -v '^groups=' "$f" > "$t"
+  [ "$g" = "none" ] || printf 'groups=%s\n' "$g" >> "$t"
+  mv "$t" "$f"
+  compile_ak
+  conf_is_repo && cmd_sync
+  log "groups set to '$g' and synced"
+}
+
+cmd_show() {
+  local m n now r age sfx lp rh rp sq by note pin
+  m=$(me)
+  [ -n "$m" ] || die "not initialized"
+  ensure_dirs
+  now=$(date +%s)
+  printf 'node\n'
+  printf '  %-14s %s@%s  profile=%s  allow=%s  groups=%s\n' "$m" \
+    "$(node_get "$m" user)" "$(node_get "$m" port)" "$(p_profile)" \
+    "$(my_allow)" "$(node_get "$m" groups)"
+  printf '\nmembers\n'
+  for n in $(peers); do
+    is_member "$n" || continue
+    if [ -f "$STATE/roster/$n" ]; then
+      r=$(cat "$STATE/roster/$n")
+      case "$r" in
+        jump\ *) set -- $r; r="$4 relayed through $2" ;;
+        via\ *) set -- $r; r="via board $2 port $3" ;;
+      esac
+      age=$(( (now - $(mtime "$STATE/roster/$n")) / 60 ))
+      printf '  %-14s %-28s %sm ago\n' "$n" "$r" "$age"
+    else
+      printf '  %-14s unresolved (dial re-resolves on use)\n' "$n"
+    fi
+  done
+  printf '\nguests\n'
+  for n in $(peers); do
+    is_member "$n" && continue
+    if [ -n "$(node_get "$n" resolve)" ]; then
+      note="dynamic (explicit resolver on this node)"
+    elif [ "$(node_get "$n" dynamic)" = 1 ]; then
+      note="dynamic"
+      ext_path "resolve-$n" >/dev/null && \
+        note="$note, resolver script present"
+      if [ -f "$STATE/records/guest-$n.rec" ]; then
+        sq=$(awk -F= '$1=="seq"{print $2;exit}' "$STATE/records/guest-$n.rec")
+        by=$(awk -F= '$1=="by"{print $2;exit}' "$STATE/records/guest-$n.rec")
+        case "$sq" in ''|*[!0-9]*) sq=0 ;; esac
+        if [ $((now - sq)) -le "${MESH_GUEST_TTL:-3600}" ]; then
+          note="$note, record $(( (now - sq) / 60 ))m old (by $by)"
+        else
+          note="$note, record stale (refreshes from peers at dial)"
+        fi
+      else
+        note="$note, no record yet"
+      fi
+    else
+      note="$(node_get "$n" static)"
+    fi
+    r=$(node_get "$n" jump)
+    [ -n "$r" ] && note="$note, via $r"
+    if [ "$(node_get "$n" identity)" = 1 ]; then
+      note="$note, device key"
+    else
+      note="$note, agent auth"
+    fi
+    if [ -s "$CONF/hostkeys/$n.pub" ] || [ -s "$STATE/hostkeys/$n.pub" ]; then
+      pin="pinned"
+    elif [ "$(node_get "$n" dynamic)" = 1 ] || \
+        [ -n "$(node_get "$n" resolve)" ]; then
+      pin="pin-at-dial"
+    else
+      pin="UNPINNED"
+    fi
+    printf '  %-14s %s@%s  %s  %s\n' "$n" "$(node_get "$n" user)" \
+      "$(node_get "$n" port)" "$pin" "$note"
+  done
+  printf '\nforwards\n'
+  for n in $(peers); do
+    is_member "$n" && continue
+    while IFS=: read -r sfx lp rh rp; do
+      [ -n "$sfx" ] && [ -n "$lp" ] || continue
+      printf '  %-18s 127.0.0.1:%-6s -> %s:%s\n' "$n-$sfx" "$lp" "$rh" "$rp"
+    done < <(node_get_all "$n" fwd)
+  done
+  return 0
+}
+
+cmd_roster() {
+  local f
+  for f in "$STATE/roster"/*; do
+    [ -f "$f" ] || continue
+    printf '%s\t%s\n' "${f##*/}" "$(cat "$f")"
+  done
+}
+
+cmd_compile() {
+  [ -n "$(me)" ] || die "not initialized"
+  ensure_dirs
+  gen_as
+  gen_kh
+  compile_ak
+  compile_sc
+  log "compiled authorized_keys, known_hosts, ssh_config"
+}
+
+usage() {
+  cat <<'EOF'
+usage: mesh <command>
+
+  invite [--serve] [--sport <p>] [--wait <s>]
+      mint a one-use, time-limited enrollment token (kept only in local
+      state, never in conf). While one is outstanding, this node's ticks
+      scan for the invited device and adopt it automatically. --serve
+      also serves conf, authenticated by the token, on <p> (43117) and
+      adopts the device the moment it reports ready: the whole
+      enrollment is this one command plus one 'mesh join' over there.
+  join <new-name> <seed-addr[:port]> --token <tok> [init options]
+      one-command enrollment, run ON the new device, which takes the
+      name <new-name>: fetch conf from a seed running 'mesh invite
+      --serve', verify it against the token (no hash to eyeball), init
+      with the invite proof, then report back so the seed adopts
+      instantly. Nothing is installed unless the token authenticates
+      the bytes.
+  init <new-name> [--static <addr>] [--port <p>] [--user <u>] [--rport <p>]
+       [--token <token>] [--groups a,b] [--allow a,b|*]
+      create this node's identity and add it to conf. --groups declares
+      what this node IS (gossiped); --allow declares who may enter it
+      (local only). --token attaches a
+      proof of the invite, bound to this device's key. To JOIN an existing
+      mesh, copy a member's ~/.config/mesh/conf here first (with its
+      .git), then run this, then 'mesh adopt' on any member. With no conf
+      present this starts a brand new mesh instead, and says so.
+  sync
+      peer-to-peer conf gossip: commit local changes, then fetch/merge
+      and push to every reachable member. No central repo exists.
+      Members also copy conf onto boards during exchange.
+  refresh
+      cheap control-plane pass: sync, then recompile authorized_keys,
+      known_hosts, ssh_config. Seconds, no scanning.
+  announce
+      "I just got network": publish record, exchange with boards and
+      peers, sync conf, recompile. Run by the tunnel supervisor on every
+      (re)connect, which is what makes address changes propagate without
+      a timer.
+
+work is event-driven: a peer's git push fires a post-receive hook that
+recompiles instantly; the tunnel supervisor announces on every reconnect
+(i.e. on every network change); dial re-resolves on demand and pulls
+records from boards before giving up; boot runs one tick. The scheduled
+tick is only a daily backstop.
+  guest <name> [<addr>] [--port <p>] [--user <u>] [--jump <node>] [--identity]
+        [--dynamic | --resolve <cmd>] [--fwd <sfx>:<lport>:<rhost>:<rport>]
+      add a dial-only node (no member key, no ticks, agent auth by
+      default); pins its host key via keyscan, verify it yourself.
+      --identity authenticates with this device's mesh key instead of
+      the agent, for machines you are willing to authorize it on:
+      append every conf/keys/*.pub to the target's authorized_keys once,
+      after which any member can add or revoke a device over ssh. Mints
+      nothing. Leave it off for anything you do not own, so the key stays
+      in the broker and nothing of yours is left behind.
+      --jump routes the dial through another guest (ssh -W).
+      --dynamic marks the address as discovered at dial time: each device
+      that should reach it supplies its own 'mesh-resolve-<name>' on PATH,
+      printing two lines, address then host public key. Keeps device-local
+      tooling out of the gossiped conf. --resolve <cmd> is the explicit
+      override when the command differs from that convention.
+      --fwd (repeatable) emits a Host <name>-<sfx> alias whose session
+      carries LocalForward <lport> -> <rhost>:<rport>.
+  tick
+      converge: sshd, keys, publish, exchange, resolve, tunnels, ssh_config
+  status        show node, peers, tunnels, managed blocks
+  roster        print resolved peers
+  publish       rebuild and sign this node's endpoint record
+  compile       regenerate authorized_keys, known_hosts, ssh_config
+  dial <peer>   resolve-on-miss transport pipe (used by ssh ProxyCommand;
+                plain 'ssh <peer>' self-heals through this)
+  tunnel <board>
+                supervised reverse-tunnel loop (started by tick)
+  daemon [--once]
+      supervise tunnels, watch local addresses, announce the moment they
+      change, and run a periodic backstop. This is the thing to keep
+      running; ticks are a fallback, not the mechanism.
+  admin [<name> <pubkey-file>]
+      show, or record, an admin signing key in conf/admins. Once any
+      admin exists, self-declared groups= are ignored and only an
+      admin-signed conf/groups counts.
+  restrict [--off]
+      force every member key arriving HERE through '<mesh> serve', which
+      speaks only gossip verbs, so a stolen device key can no longer open
+      a shell on this node. Shells then need an operator key from an
+      agent. Refuses to run with no conf/operators, since that would
+      leave no way in. Affects this node's inbound door only.
+  operator [<name> <pubkey-file>|--remove] [--as <admin>]
+      show, or record, a login key in conf/operators. Operator keys are
+      authorized on every member regardless of groups or allow, so they
+      are your way back in when a policy change locks you out. Adding one
+      needs an admin signature, so a stolen device key cannot mint itself
+      a shell. Keep the private half in an agent, never on disk.
+  group [<node> <a,b>] [--as <admin>]
+      show, or set, a node's groups in conf/groups and re-sign it. The
+      admin private key may live in an ssh-agent, so this works with
+      nothing on disk.
+  allow [<groups>|*]
+      show or set which groups may open ssh to THIS node. Stored in local
+      state, never gossiped, so no peer can widen your own door.
+  groups [<a,b>|none]
+      show or set THIS node's self-declared groups in its own conf entry,
+      then sync. Refused once conf/admins exists, since assignments are
+      then admin-signed via 'mesh group'.
+  show
+      one screen: this node, members with routes and ages, guests with
+      whether they are usable HERE (resolver present, fresh gossiped
+      record, or static) and pinned or not, and the forward aliases.
+
+unknown subcommands dispatch to 'mesh-<command>' on PATH, so extensions
+(mesh-resolve-<guest> and anything else you write) plug in without editing
+this script. They are exec'd with MESH_NODE, MESH_ROOT, MESH_CONF and
+MESH_STATE exported, so an extension need not hardcode where state lives.
+  schedule
+      detect the platform and install the right supervisor: Termux:Boot
+      plus a job-scheduler backstop, a systemd user unit with lingering,
+      or cron. Cadence follows a detected profile (battery = mobile).
+  adopt <user@host> [--port <p>] | adopt --scan
+      run on an EXISTING member to pull a newly initialized device's
+      conf directly from it; needs no pre-existing credential, since
+      that device already authorized every member when it compiled.
+      Use --port 8022 for Termux devices. --scan sweeps the local
+      subnets for un-enrolled devices that accept this node's key,
+      reports what each would add, and prints the command to run.
+      --auto also adopts, but only devices presenting a valid invite
+      proof; anything without one is reported, never merged.
+  reset [--all]
+      stop tunnels, strip both managed blocks, cancel schedules, delete
+      state; --all also deletes conf (full uninstall on this device)
+
+access policy is fixed: member keys get full ssh on every node, and
+sftp-plus-forwarding only (no shell) on static nodes; extra restricted
+keys go in authorized_keys by hand outside the managed block
+
+conf  (shared, sync it yourself): $MESH_CONF   default ~/.config/mesh/conf
+state (local, never synced):      $MESH_STATE  default ~/.config/mesh/state
+platform overrides: define p_addrs, p_hostkey_pub, p_ensure_sshd, p_schedule
+in conf/platform.sh (shared) or state/platform.sh (this node)
+EOF
+}
+
+cmd=$1
+[ -n "$cmd" ] && shift
+case "$cmd" in
+  ''|help|-h|--help) ;;
+  *) load_platform ;;
+esac
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  join) cmd_join "$@" ;;
+  guest) cmd_guest "$@" ;;
+  invite) cmd_invite "$@" ;;
+  daemon) cmd_daemon "$@" ;;
+  admin) cmd_admin "$@" ;;
+  operator) cmd_operator "$@" ;;
+  serve) cmd_serve ;;
+  restrict) ensure_dirs; cmd_restrict "$@" ;;
+  group) cmd_group "$@" ;;
+  groups) cmd_groups "$@" ;;
+  show) cmd_show ;;
+  allow) cmd_allow "$@" ;;
+  confcheck) cmd_confcheck ;;
+  adopt) cmd_adopt "$@" ;;
+  reset) cmd_reset "$@" ;;
+  sync) cmd_sync ;;
+  refresh) cmd_refresh ;;
+  announce) cmd_announce ;;
+  tick) cmd_tick ;;
+  status) cmd_status ;;
+  roster) cmd_roster ;;
+  publish) ensure_dirs; cmd_publish ;;
+  compile) cmd_compile ;;
+  dial) cmd_dial "$@" ;;
+  tunnel) cmd_tunnel "$@" ;;
+  schedule) p_schedule ;;
+  help|-h|--help) usage ;;
+  *)
+    if ext=$(ext_path "$cmd"); then
+      export MESH_ROOT MESH_CONF="$CONF" MESH_STATE="$STATE" MESH_NODE="$(me)"
+      exec "$ext" "$@"
+    fi
+    usage
+    exit 1
+    ;;
+esac
