@@ -560,7 +560,7 @@ cmd_daemon() {
   pnodes=$(nodes | sort | tr '\n' ',')
   last=$(date +%s)
   while :; do
-    sleep "$poll"
+    sleep "$poll" 4>&-
     cur=$(p_addrs | sort | tr '\n' ',')
     if [ "$cur" != "$prev" ]; then
       log "addresses changed: ${prev:-none} -> ${cur:-none}"
