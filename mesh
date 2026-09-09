@@ -459,13 +459,26 @@ start_daemon_bg() {
 }
 
 p_schedule() {
-  local self unit boot
+  local self unit boot svc
   self=$SELF
   log "profile: $(p_profile) (keepalive $(alive_interval)s, poll $(poll_interval)s)"
   if is_termux && command -v termux-job-scheduler >/dev/null 2>&1; then
+    svc="$(tx_prefix)/var/service/mesh"
+    if command -v sv-enable >/dev/null 2>&1 && [ -d "${svc%/mesh}" ]; then
+      mkdir -p "$svc/log"
+      printf '#!%s/bin/sh\nexec %q daemon 2>&1\n' "$(tx_prefix)" "$self" > "$svc/run"
+      printf '#!%s/bin/sh\np=${PWD%%/*}\nexec svlogd -tt "$LOGDIR/sv/${p##*/}"\n' \
+        "$(tx_prefix)" > "$svc/log/run"
+      chmod 700 "$svc/run" "$svc/log/run"
+      sv-enable mesh >/dev/null 2>&1
+      sv up mesh >/dev/null 2>&1
+      log "runsv service installed: sv status mesh"
+    else
+      log "termux-services missing; the daemon will not survive a closed session"
+    fi
     boot="$HOME/.termux/boot/start-mesh.sh"
     if [ -d "$HOME/.termux/boot" ]; then
-      printf '#!%s/bin/sh\nexec %q daemon\n' "$(tx_prefix)" "$self" > "$boot"
+      printf '#!%s/bin/sh\nsv-enable mesh\nsv up mesh\n' "$(tx_prefix)" > "$boot"
       chmod 700 "$boot"
       log "termux:boot script installed: $boot"
     else
@@ -477,7 +490,6 @@ p_schedule() {
       --period-ms "${MESH_PERIOD_MS:-86400000}" --persisted true --network any \
       >/dev/null 2>&1
     log "job-scheduler 3388 installed as the restart-if-dead backstop"
-    start_daemon_bg
     log "undo: mesh reset (cancels the job and removes the boot script)"
     return 0
   fi
@@ -1943,6 +1955,12 @@ cmd_reset() {
     termux-job-scheduler --cancel --job-id 3388 >/dev/null 2>&1
   fi
   rm -f "$HOME/.termux/boot/start-mesh.sh"
+  if is_termux && [ -d "$(tx_prefix)/var/service/mesh" ]; then
+    sv-disable mesh >/dev/null 2>&1
+    sv down mesh >/dev/null 2>&1
+    rm -rf "$(tx_prefix)/var/service/mesh"
+    log "runsv service removed"
+  fi
   if have_systemd_user && [ -f "$HOME/.config/systemd/user/mesh.service" ]; then
     systemctl --user disable --now mesh.service >/dev/null 2>&1
     rm -f "$HOME/.config/systemd/user/mesh.service"
