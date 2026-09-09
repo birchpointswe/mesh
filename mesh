@@ -467,7 +467,7 @@ p_schedule() {
     if command -v sv-enable >/dev/null 2>&1 && [ -d "${svc%/mesh}" ]; then
       mkdir -p "$svc/log"
       printf '#!%s/bin/sh\nexec %q daemon 2>&1\n' "$(tx_prefix)" "$self" > "$svc/run"
-      printf '#!%s/bin/sh\np=${PWD%%/*}\nexec svlogd -tt "$LOGDIR/sv/${p##*/}"\n' \
+      printf '#!%s/bin/sh\np=${PWD%%/*}\np=${p##*/}\nmkdir -p "$LOGDIR/sv/$p"\nexec svlogd -tt "$LOGDIR/sv/$p"\n' \
         "$(tx_prefix)" > "$svc/log/run"
       chmod 700 "$svc/run" "$svc/log/run"
       sv-enable mesh >/dev/null 2>&1
