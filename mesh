@@ -570,7 +570,7 @@ guest_addr() {
     log "$n is dynamic, no 'mesh-resolve-$n' here, and no fresh record"
     return 1
   fi
-  if ! out=$("$rcmd" 2>/dev/null); then
+  if ! out=$(guest_resolve "$n" "$rcmd"); then
     guest_gossiped "$n" && return 0
     return 1
   fi
@@ -583,6 +583,21 @@ guest_addr() {
     publish_guest "$n" "$addr" "$hk"
   fi
   printf '%s\n' "$addr"
+}
+
+guest_resolve() {
+  local n=$1 rcmd=$2 err="$STATE/tmp/resolve-$1.err" try out msg
+  for try in 1 2; do
+    if out=$("$rcmd" 2>"$err"); then
+      rm -f "$err"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    [ "$try" = 2 ] || sleep "${MESH_RESOLVE_RETRY_WAIT:-3}"
+  done
+  msg=$(tail -n 1 "$err" 2>/dev/null)
+  log "resolver for $n failed twice: ${msg:-no output}"
+  return 1
 }
 
 guest_record_fresh() {
@@ -605,7 +620,7 @@ publish_guest() {
 }
 
 guest_gossiped() {
-  local n=$1 f="$STATE/records/guest-$1.rec" sq now addr hk
+  local n=$1 f="$STATE/records/guest-$1.rec" sq now addr hk port
   if guest_record_fresh "$n"; then
     :
   elif [ -z "$GUEST_REFRESHED" ]; then
@@ -617,13 +632,17 @@ guest_gossiped() {
   sq=$(awk -F= '$1=="seq"{print $2; exit}' "$f")
   case "$sq" in ''|*[!0-9]*) return 1 ;; esac
   now=$(date +%s)
-  [ $((now - sq)) -le "${MESH_GUEST_TTL:-3600}" ] || {
-    log "gossiped endpoint for $n is stale, ignoring"
-    return 1
-  }
   addr=$(awk -F= '$1=="addr"{print $2; exit}' "$f")
   hk=$(awk -F= '$1=="hostkey"{print substr($0,9); exit}' "$f")
   [ -n "$addr" ] && [ -n "$hk" ] || return 1
+  if [ $((now - sq)) -gt "${MESH_GUEST_TTL:-3600}" ]; then
+    port=$(node_get "$n" port)
+    port_open "$addr" "${port:-22}" || {
+      log "gossiped endpoint for $n is stale and $addr does not answer"
+      return 1
+    }
+    log "record for $n is $(( (now - sq) / 60 )) min old but $addr answers, using it"
+  fi
   printf '%s\n' "$hk" > "$STATE/hostkeys/$n.pub"
   gen_kh
   log "$n located from a record published by $(awk -F= '$1=="by"{print $2; exit}' "$f")"
