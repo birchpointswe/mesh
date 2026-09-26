@@ -363,7 +363,9 @@ p_ensure_sshd() {
   [ -n "$port" ] || return 1
   port_open 127.0.0.1 "$port" && return 0
   if is_termux; then
-    sv up sshd 2>/dev/null || sshd 2>/dev/null
+    export SVDIR="$(tx_prefix)/var/service"
+    service-daemon start >/dev/null 2>&1
+    sv up sshd 2>/dev/null
   else
     systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || \
       /usr/sbin/sshd 2>/dev/null
@@ -412,7 +414,8 @@ p_schedule() {
     fi
     boot="$HOME/.termux/boot/start-mesh.sh"
     if [ -d "$HOME/.termux/boot" ]; then
-      printf '#!%s/bin/sh\nsv-enable mesh\nsv up mesh\n' "$(tx_prefix)" > "$boot"
+      printf '#!%s/bin/sh\n. %s/etc/profile.d/start-services.sh\nsv-enable mesh\n' \
+        "$(tx_prefix)" "$(tx_prefix)" > "$boot"
       chmod 700 "$boot"
       log "termux:boot script installed: $boot"
     else
