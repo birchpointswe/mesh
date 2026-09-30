@@ -179,6 +179,25 @@ or cron. The daemon is event-driven rather than polled: it reacts to address
 changes, membership changes and unresolved peers, with a long backstop. Poll
 intervals follow a profile chosen from whether the machine roams or stays put.
 
+## Locking
+
+Mesh serializes its runs with `flock` on three state files:
+
+| Lock | fd | Held by |
+|---|---|---|
+| `state/lock` | 9 | `mesh tick` |
+| `state/daemon.lock` | 4 | `mesh daemon`, for its whole life |
+| `state/sync.lock` | 6 | `mesh sync` |
+
+- A `flock` lock belongs to the open file, and every process that inherits the
+  fd shares it. The lock stays held until the last copy closes.
+- So a child that outlives its caller while a lock fd is open, such as a
+  `sleep`, a backgrounded daemon or a persistent ssh master, keeps the lock.
+  The next run then reports "already running" until that child exits.
+- Close the lock fd in the child's redirections, as the daemon loop does with
+  `sleep "$poll" 4>&-`, or release the lock before starting anything that
+  outlives the caller.
+
 ## Commands
 
     init <name> --operator <pubkey>
