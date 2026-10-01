@@ -195,8 +195,9 @@ Mesh serializes its runs with `flock` on three state files:
   `sleep`, a backgrounded daemon or a persistent ssh master, keeps the lock.
   The next run then reports "already running" until that child exits.
 - Close the lock fd in the child's redirections, as the daemon loop does with
-  `sleep "$poll" 4>&-`, or release the lock before starting anything that
-  outlives the caller.
+  `sleep "$poll" 4>&-` and `p_ensure_sshd` does with `4>&- 9>&-` when it
+  starts the service supervisor or sshd, or release the lock before starting
+  anything that outlives the caller.
 
 ## Commands
 

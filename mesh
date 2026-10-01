@@ -364,11 +364,11 @@ p_ensure_sshd() {
   port_open 127.0.0.1 "$port" && return 0
   if is_termux; then
     export SVDIR="$(tx_prefix)/var/service"
-    service-daemon start >/dev/null 2>&1
-    sv up sshd 2>/dev/null
+    service-daemon start >/dev/null 2>&1 4>&- 9>&-
+    sv up sshd 2>/dev/null 4>&- 9>&-
   else
     systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || \
-      /usr/sbin/sshd 2>/dev/null
+      /usr/sbin/sshd 2>/dev/null 4>&- 9>&-
   fi
   sleep 1
   port_open 127.0.0.1 "$port"
