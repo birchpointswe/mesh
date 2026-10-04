@@ -1199,7 +1199,7 @@ sweep() {
 }
 
 pipe_to() {
-  local n=$1 r=$2 port=$3 b p baddr bport buser cp reg iid
+  local n=$1 r=$2 port=$3 b p baddr bport buser cp reg iid acmd key
   local -a jopts
   case "$r" in
     jump\ *)
@@ -1213,6 +1213,10 @@ pipe_to() {
         jopts=("${SOPTS[@]}")
       else
         jopts=("${GOPTS[@]}")
+      fi
+      if acmd=$(ext_path "auth-$b"); then
+        key=$("$acmd" "$baddr") || die "mesh-auth-$b failed for $b"
+        jopts+=(-i "$key" -o IdentitiesOnly=yes)
       fi
       case "$baddr" in
         ssm:*)
@@ -1809,7 +1813,11 @@ usage: mesh <command>
       on PATH, printing two lines, address then host public key. That
       keeps device-local tooling out of the gossiped conf, and whichever
       device resolves it publishes a signed record so the others do not
-      need the tooling.
+      need the tooling. An address 'ssm:<region>:<instance-id>' dials
+      over AWS SSM (AWS-StartSSHSession) and needs aws and the session
+      manager plugin. When a jump node has 'mesh-auth-<jump>' on PATH,
+      each dial through it runs that with the jump's address; it prints
+      the path of a private key, which the tunnel's ssh logs in with.
       --fwd (repeatable) emits a Host <name>-<sfx> alias whose session
       carries LocalForward <lport> -> <rhost>:<rport>.
   operator [<name> <pubkey-file>|--remove] [--as <operator>]
