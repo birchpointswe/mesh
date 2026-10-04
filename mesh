@@ -641,12 +641,19 @@ guest_gossiped() {
   hk=$(awk -F= '$1=="hostkey"{print substr($0,9); exit}' "$f")
   [ -n "$addr" ] && [ -n "$hk" ] || return 1
   if [ $((now - sq)) -gt "${MESH_GUEST_TTL:-3600}" ]; then
-    port=$(node_get "$n" port)
-    port_open "$addr" "${port:-22}" || {
-      log "gossiped endpoint for $n is stale and $addr does not answer"
-      return 1
-    }
-    log "record for $n is $(( (now - sq) / 60 )) min old but $addr answers, using it"
+    case "$addr" in
+      ssm:*)
+        log "record for $n is $(( (now - sq) / 60 )) min old, using its ssm address unprobed"
+        ;;
+      *)
+        port=$(node_get "$n" port)
+        port_open "$addr" "${port:-22}" || {
+          log "gossiped endpoint for $n is stale and $addr does not answer"
+          return 1
+        }
+        log "record for $n is $(( (now - sq) / 60 )) min old but $addr answers, using it"
+        ;;
+    esac
   fi
   printf '%s\n' "$hk" > "$STATE/hostkeys/$n.pub"
   gen_kh
@@ -1192,7 +1199,7 @@ sweep() {
 }
 
 pipe_to() {
-  local n=$1 r=$2 port=$3 b p baddr bport buser cp
+  local n=$1 r=$2 port=$3 b p baddr bport buser cp reg iid
   local -a jopts
   case "$r" in
     jump\ *)
@@ -1207,8 +1214,20 @@ pipe_to() {
       else
         jopts=("${GOPTS[@]}")
       fi
+      case "$baddr" in
+        ssm:*)
+          IFS=: read -r _ reg iid <<< "$baddr"
+          jopts+=(-o "ProxyCommand=aws ssm start-session --region $reg --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p")
+          baddr=$iid
+          ;;
+      esac
       exec ssh "${jopts[@]}" -o "HostKeyAlias=$b" -p "$bport" \
         -W "$p:$port" "$buser@$baddr"
+      ;;
+    ssm:*)
+      IFS=: read -r _ reg iid <<< "$r"
+      exec aws ssm start-session --region "$reg" --target "$iid" \
+        --document-name AWS-StartSSHSession --parameters "portNumber=$port"
       ;;
     *)
       if command -v nc >/dev/null 2>&1; then
